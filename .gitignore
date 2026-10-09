@@ -1,0 +1,39 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+build/
+*.tsbuildinfo
+
+# local env + secrets (never commit)
+.env
+.env.*
+!.env.example
+*.local.yaml
+!values-local.yaml
+secrets/
+*.pem
+*.key
+kubeconfig*
+
+# helm
+charts/**/charts/
+*.tgz
+
+# logs / caches
+*.log
+npm-debug.log*
+.eslintcache
+coverage/
+.vite/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+

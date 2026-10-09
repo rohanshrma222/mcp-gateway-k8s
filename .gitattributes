@@ -1,0 +1,10 @@
+# Normalise to LF in the repo. Critical on Windows: a CRLF shell script copied into a
+# Linux container fails with "bad interpreter", which is a painful thing to debug in a
+# wp-cli bootstrap Job or a container entrypoint.
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+
+*.png binary
+*.jpg binary
+*.pdf binary
