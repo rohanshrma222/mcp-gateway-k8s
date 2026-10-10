@@ -1,0 +1,44 @@
+# Calico CNI, installed by scripts/bootstrap.ps1 into the tigera-operator namespace.
+#
+# Why Calico at all: kind/cluster.yaml sets disableDefaultCNI because kind's built-in
+# CNI (kindnet) does not enforce NetworkPolicy. Without a policy-capable CNI, every
+# NetworkPolicy in this project would be accepted by the API server and enforced by
+# nothing - the upstream-isolation requirement would look satisfied and be fiction.
+#
+# Installed with Helm rather than `kubectl create -f tigera-operator.yaml` for two
+# reasons: Helm is already the mandatory tool for this project, and the raw operator
+# manifest is large enough that `kubectl apply` can fail on the
+# last-applied-configuration annotation size limit.
+installation:
+  enabled: true
+
+  # The operator special-cases kind (kubelet paths, no BGP peers to discover).
+  # Stating it beats relying on auto-detection.
+  kubernetesProvider: Kind
+
+  # Keep the Calico CSI driver off: nothing here needs Calico-provided volumes.
+  kubeletVolumePluginPath: 'None'
+
+  calicoNetwork:
+    # VXLAN rather than IPIP: IPIP is frequently blocked or mangled inside Docker
+    # networking, and VXLAN is the encapsulation that behaves predictably on kind.
+    # CrossSubnet keeps traffic unencapsulated between nodes that share a subnet,
+    # which all kind nodes do, so the common path stays cheap.
+    #
+    # BGP is disabled because VXLAN does not need it. Leaving BGP on would start
+    # route-reflector machinery that has nothing to peer with on a single Docker host.
+    bgp: Disabled
+    linuxDataplane: Iptables
+
+    # Required: Traefik binds node ports 80/443 through a Kubernetes hostPort, and
+    # Calico is what programs hostPort rules once it owns the dataplane.
+    hostPorts: Enabled
+
+    ipPools:
+      # Must match networking.podSubnet in kind/cluster.yaml. Deliberately NOT
+      # Calico's own 192.168.0.0/16 default, which can overlap a home LAN and produce
+      # intermittent failures that look like cluster bugs.
+      - cidr: 10.244.0.0/16
+        encapsulation: VXLANCrossSubnet
+        natOutgoing: Enabled
+        nodeSelector: all()

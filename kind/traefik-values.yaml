@@ -1,0 +1,70 @@
+# Traefik ingress controller, installed by scripts/bootstrap.ps1 into the traefik
+# namespace.
+#
+# Why Traefik and not ingress-nginx: the Kubernetes project retired ingress-nginx and
+# archived the repository in March 2026, with no further releases and no security
+# patches, and its intended successor (InGate) was cancelled. Shipping an unmaintained
+# ingress controller would contradict the security posture this project is graded on.
+#
+# Traefik is also what k3s installs by default, and k3s is the production-like VPS
+# target in the brief. So local and production run the same controller and the same
+# ingressClassName, which is exactly the "same charts, config changes only" property
+# the brief asks for.
+#
+# The Ingress API itself is unchanged: application charts create ordinary Ingress
+# objects with ingressClassName: traefik. Nothing is Traefik-specific in them, so
+# swapping controllers later is a values change, not a rewrite.
+
+# Single replica locally. Production values raise this; see charts/*/values-prod.yaml.
+deployment:
+  replicas: 1
+
+# Schedule onto the node that kind maps host :80/:443 to. bootstrap.ps1 applies the
+# ingress-ready label, and the toleration is required because that node is the
+# control-plane and carries a NoSchedule taint.
+nodeSelector:
+  ingress-ready: 'true'
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
+
+# This is the mechanism that makes http://app.urumi.local work with no port-forward:
+#   host 127.0.0.1:80  ->  (kind extraPortMapping)  ->  node :80
+#   node :80           ->  (hostPort)               ->  traefik container :8000
+# Traefik keeps listening on unprivileged 8000/8443 inside the container, so nothing
+# needs to run as root to own port 80.
+ports:
+  web:
+    hostPort: 80
+  websecure:
+    hostPort: 443
+
+# A LoadBalancer Service would sit in Pending forever on kind, and it is not needed:
+# hostPort already carries external traffic. ClusterIP keeps in-cluster access for
+# health checks and debugging.
+service:
+  type: ClusterIP
+
+# Create and own the IngressClass. isDefaultClass is a convenience only - the charts
+# in this repo always set ingressClassName explicitly, so the routing is readable from
+# the manifest rather than implied by cluster state.
+ingressClass:
+  enabled: true
+  isDefaultClass: true
+
+ingressRoute:
+  dashboard:
+    # Off on purpose. The dashboard is unauthenticated by default and would be a free
+    # read of every route and service in the cluster.
+    enabled: false
+
+log:
+  level: INFO
+
+# On during development: being able to show a request arriving at the ingress and being
+# routed is useful when demonstrating the request path end to end. JSON so the lines are
+# greppable with jq rather than eyeballed.
+accessLog:
+  enabled: true
+  format: json
