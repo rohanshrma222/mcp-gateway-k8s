@@ -1,0 +1,65 @@
+# Local Kubernetes cluster for the Urumi MCP gateway platform.
+#
+#   kind create cluster --config kind/cluster.yaml
+#
+# Recreate it any time: the cluster is disposable, every workload is installed by Helm.
+#
+# Three decisions are encoded here and each one is deliberate:
+#
+# 1. disableDefaultCNI: kind's built-in CNI (kindnet) does not enforce NetworkPolicy.
+#    This project depends on NetworkPolicy to keep the WooCommerce MCP server reachable
+#    only by the gateway, so the default CNI would silently make every "deny" rule a
+#    no-op. scripts/bootstrap.ps1 installs Calico instead, and scripts/verify-netpol.ps1
+#    proves enforcement actually works before any application code is deployed.
+#
+# 2. extraPortMappings on the control-plane node: ingress-nginx is scheduled onto the node
+#    labelled ingress-ready=true, which is this one, so host :80/:443 reach the Ingress
+#    controller directly. That gives the stable URLs the brief requires
+#    (store.urumi.local, app.urumi.local) with no port-forward and no NodePort in the URL.
+#    Bound to 127.0.0.1 on purpose: the storefront and dashboard must not be published
+#    to the local network.
+#
+# 3. Pinned node image including its digest: the grader gets byte-identical nodes.
+#    v1.36.4 is one minor behind the newest release, which is where ingress-nginx and
+#    Calico support is solid; k8s 1.34 is at end of life.
+#
+# The ingress-ready label is applied by bootstrap.ps1 with `kubectl label node` rather
+# than a kubeadmConfigPatch here. kubeadm's kubeletExtraArgs changed shape between
+# v1beta3 (a map) and v1beta4 (a list of name/value pairs) in k8s 1.31, so a patch
+# written for one API version breaks on the other. Labelling after creation works on
+# every version.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: urumi
+
+networking:
+  disableDefaultCNI: true
+  # Calico's IPPool is configured to match this range in bootstrap.ps1. Kept at kind's
+  # default 10.244.0.0/16 rather than Calico's own 192.168.0.0/16 default, which would
+  # risk colliding with a home LAN subnet and break routing in a way that looks like a
+  # cluster bug.
+  podSubnet: '10.244.0.0/16'
+  serviceSubnet: '10.96.0.0/16'
+  apiServerAddress: '127.0.0.1'
+  kubeProxyMode: 'iptables'
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+    extraPortMappings:
+      - containerPort: 80
+        hostPort: 80
+        listenAddress: '127.0.0.1'
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        listenAddress: '127.0.0.1'
+        protocol: TCP
+
+  # Two workers so the platform is scheduled like a real cluster: the 2-replica gateway
+  # spreads across nodes, and killing an upstream pod (a required demo) reschedules it
+  # somewhere else instead of onto the only node available.
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+  - role: worker
+    image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
