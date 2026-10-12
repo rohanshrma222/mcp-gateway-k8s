@@ -1,0 +1,60 @@
+# charts/store - k3s VPS.
+#
+# Read this next to values-local.yaml: the difference between the two files is the whole
+# answer to "what changes between local and production?". No template, no resource kind
+# and no structure differs - only these values.
+
+global:
+  # k3s ships Rancher's local-path provisioner, not `standard`.
+  storageClass: local-path
+  imageRegistry: ghcr.io/rohanshrma222
+  # Digests are pinned below, but the policy still matters for the third-party images
+  # that are tagged: Always means a replaced node pulls the intended bytes rather than
+  # whatever its cache happens to hold.
+  imagePullPolicy: Always
+
+store:
+  host: store.example.com
+
+mariadb:
+  # Pinned by digest in production: a tag can be repointed, a digest cannot.
+  image:
+    digest: ''  # set at release time, e.g. sha256:...
+  persistence:
+    size: 20Gi
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { cpu: '2', memory: 2Gi }
+
+wordpress:
+  environmentType: production
+  # Two replicas is only safe because wp-content is a shared volume; on a single-node
+  # k3s VPS with local-path the PVC is node-local, so this stays 1 until the volume is
+  # RWX. Stated here rather than silently assumed.
+  replicas: 1
+  persistence:
+    size: 20Gi
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: '2', memory: 1536Mi }
+
+wooMcp:
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: '1', memory: 384Mi }
+
+ingress:
+  className: traefik
+  tls:
+    enabled: true
+    secretName: store-tls
+    clusterIssuer: letsencrypt-prod
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Redirect plain HTTP at the edge rather than in WordPress, so the app never has to
+    # know whether it is behind TLS.
+    traefik.ingress.kubernetes.io/router.middlewares: default-redirect-https@kubernetescrd
+
+networkPolicy:
+  enabled: true

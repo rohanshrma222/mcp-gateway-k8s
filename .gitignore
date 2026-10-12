@@ -37,3 +37,11 @@ Thumbs.db
 !.vscode/extensions.json
 
 
+
+# helm: resolved subchart archives.
+# `helm dependency update` packs charts/common into each chart's charts/ directory as a
+# .tgz. That is a build artifact of a chart already in this repo, so committing it would
+# store the same templates twice and let the copy drift. Chart.lock IS committed, so the
+# resolution is reproducible: run `helm dependency build charts/<name>` after cloning.
+charts/*/charts/
+

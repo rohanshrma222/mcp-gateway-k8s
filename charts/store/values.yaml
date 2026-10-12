@@ -1,0 +1,188 @@
+# charts/store - defaults shared by every environment.
+#
+# Rule for this file and its siblings: values.yaml holds everything that is true
+# everywhere, and values-local.yaml / values-prod.yaml hold only what genuinely differs
+# between a laptop and a k3s VPS. If a key appears in both overlays with different
+# values, it belongs here with one of them as the default. That discipline is what makes
+# `helm template -f values-prod.yaml` diff against local as *config only*, which is the
+# property the brief asks to be demonstrated.
+
+nameOverride: ''
+fullnameOverride: ''
+
+global:
+  # Empty locally: images are built and `kind load docker-image`d, so there is no
+  # registry in the reference. values-prod.yaml sets this to GHCR.
+  imageRegistry: ''
+  imagePullPolicy: IfNotPresent
+  # Empty means "use the cluster default StorageClass". kind provides `standard`,
+  # k3s provides `local-path`; naming it per environment keeps this chart portable.
+  storageClass: ''
+
+store:
+  # Identifies this store. Every object name and the MCP server slug derive from it, so
+  # installing a second store is `--set store.slug=acme` in its own namespace.
+  slug: default
+  host: store.urumi.local
+
+# --------------------------------------------------------------------- mariadb
+
+mariadb:
+  image:
+    repository: mariadb
+    tag: '11.8.4'
+  # Credentials are never literals here. The chart generates them on first install with
+  # `lookup` + `randAlphaNum` and reuses the existing Secret afterwards, so a
+  # `helm upgrade` cannot rotate the password out from under a PVC that still holds data
+  # encrypted-at-rest under the old one. Set existingSecret to bring your own.
+  auth:
+    database: wordpress
+    username: wordpress
+    existingSecret: ''
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: ''
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: '1', memory: 1Gi }
+  probes:
+    # `mysqladmin ping` answers once the server accepts connections, which is the only
+    # thing a dependent cares about. A TCP check would pass while the server was still
+    # replaying its redo log.
+    readiness:
+      exec:
+        command: ['sh', '-c', 'mariadb-admin ping -u root -p"$MARIADB_ROOT_PASSWORD"']
+      periodSeconds: 10
+      timeoutSeconds: 5
+    liveness:
+      exec:
+        command: ['sh', '-c', 'mariadb-admin ping -u root -p"$MARIADB_ROOT_PASSWORD"']
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 6
+    # First boot initialises the data directory, which is far slower than steady state.
+    # Without this, the liveness timeout would have to be long enough to cover first run
+    # and would then be useless for detecting a wedged server later.
+    startup:
+      exec:
+        command: ['sh', '-c', 'mariadb-admin ping -u root -p"$MARIADB_ROOT_PASSWORD"']
+      periodSeconds: 5
+      failureThreshold: 60
+  securityContext:
+    # The entrypoint takes ownership of the data directory on first run, so the root
+    # filesystem cannot be read-only here. Stated in values rather than hidden in a
+    # template, so the exception is visible to whoever reviews this.
+    readOnlyRootFilesystem: false
+    runAsUser: 999
+    runAsGroup: 999
+    fsGroup: 999
+
+# ------------------------------------------------------------------- wordpress
+
+wordpress:
+  image:
+    repository: wordpress
+    tag: '6.9.1-php8.4-apache'
+  replicas: 1
+  # local | production. Set to `local` by values-local.yaml, and that is load-bearing:
+  # WordPress only offers Application Passwords over plain HTTP when
+  # wp_get_environment_type() is `local`, and the WooCommerce MCP server authenticates
+  # to the REST API with one. In production this becomes `production` and the connection
+  # is TLS end to end.
+  environmentType: production
+  persistence:
+    # wp-content only: plugins, themes and uploads. WordPress core comes from the image,
+    # so it is replaced on upgrade rather than persisted and left stale.
+    enabled: true
+    size: 4Gi
+    storageClass: ''
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: '1', memory: 768Mi }
+  probes:
+    # Readiness on a page that requires PHP *and* the database. Liveness on a static
+    # path served by Apache alone - pointing liveness at the database would turn a
+    # MariaDB blip into a WordPress restart loop, which is strictly worse than serving
+    # an error page.
+    readiness:
+      httpGet: { path: /wp-login.php, port: http }
+      periodSeconds: 10
+      timeoutSeconds: 5
+    liveness:
+      httpGet: { path: /, port: http }
+      periodSeconds: 30
+      timeoutSeconds: 5
+      failureThreshold: 6
+    startup:
+      httpGet: { path: /, port: http }
+      periodSeconds: 5
+      failureThreshold: 60
+  securityContext:
+    # Apache writes to /var/run and php-fpm to its session and opcache directories, both
+    # outside the wp-content PVC.
+    readOnlyRootFilesystem: false
+    runAsUser: 33
+    runAsGroup: 33
+    fsGroup: 33
+  ports:
+    - name: http
+      containerPort: 80
+
+# --------------------------------------------------------------------- woo-mcp
+
+wooMcp:
+  image:
+    repository: urumi/woo-mcp
+    tag: dev
+  replicas: 1
+  # No ingress key at all, and that is the point: the WooCommerce MCP server has no
+  # external route to disable, so "unreachable from outside the cluster" is a property of
+  # what does not exist rather than a rule someone has to maintain.
+  resources:
+    requests: { cpu: 50m, memory: 96Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  probes:
+    readiness:
+      httpGet: { path: /readyz, port: http }
+      periodSeconds: 10
+    liveness:
+      httpGet: { path: /healthz, port: http }
+      periodSeconds: 30
+      failureThreshold: 6
+  securityContext:
+    # A Node process serving HTTP has no reason to write to its own filesystem, so it
+    # keeps every default: non-root, read-only root, all capabilities dropped.
+    runAsUser: 1000
+    runAsGroup: 1000
+  ports:
+    - name: http
+      containerPort: 3000
+  timeoutSeconds: 20
+
+# --------------------------------------------------------------------- ingress
+
+ingress:
+  enabled: true
+  # Same class locally and in production, because k3s ships Traefik by default. The
+  # charts emit plain Ingress objects, so nothing here is Traefik-specific.
+  className: traefik
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ''
+    # cert-manager issuer; prod only.
+    clusterIssuer: ''
+
+# ---------------------------------------------------------------- networkpolicy
+
+networkPolicy:
+  # Default-deny in this namespace plus the specific allows. Enforcement was verified by
+  # scripts/verify-netpol.ps1 before any of this was written.
+  enabled: true
+  # Pods matching these labels may reach woo-mcp. Written as a selector rather than a
+  # CIDR so that rescheduling the gateway onto another node cannot break the rule.
+  gatewayPodLabels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: gateway
+  gatewayNamespace: urumi-platform

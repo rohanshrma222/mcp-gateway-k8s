@@ -1,0 +1,13 @@
+apiVersion: v2
+name: upstreams
+description: >-
+  Additional MCP servers behind the gateway: notes-mcp (ours, and deliberately exposing a
+  colliding tool name) and everything-mcp (third-party, pinned). Neither has an Ingress;
+  both are reachable only from the gateway.
+type: application
+version: 0.1.0
+appVersion: '0.1.0'
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common

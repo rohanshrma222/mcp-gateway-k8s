@@ -1,0 +1,25 @@
+# charts/platform - local kind cluster.
+
+global:
+  storageClass: standard
+  imagePullPolicy: IfNotPresent
+
+platform:
+  host: app.urumi.local
+
+postgres:
+  persistence:
+    size: 2Gi
+
+gateway:
+  # Still 2 locally. The point of the replica count is to prove the /mcp endpoint is
+  # genuinely stateless, and proving that on a laptop is the whole reason the kind
+  # cluster has two worker nodes.
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 384Mi }
+
+ingress:
+  tls:
+    enabled: false

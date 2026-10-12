@@ -1,0 +1,12 @@
+apiVersion: v2
+name: platform
+description: >-
+  The control plane: Postgres, the gateway (MCP client to every upstream and itself one
+  MCP server endpoint) and the React dashboard. Installed once per cluster.
+type: application
+version: 0.1.0
+appVersion: '0.1.0'
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common

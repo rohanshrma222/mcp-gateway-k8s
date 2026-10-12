@@ -1,0 +1,11 @@
+apiVersion: v2
+name: common
+description: >-
+  Shared template partials for every chart in this repo. Exists so that the
+  mandatory requirements - a readiness and liveness probe, resource requests and
+  limits, and a hardened securityContext on every workload - are defined once and
+  inherited, instead of being copied into each chart and drifting.
+type: library
+version: 0.1.0
+# A library chart is never installed. `helm install charts/common` is an error by
+# design; it is consumed as a dependency by store, platform and upstreams.

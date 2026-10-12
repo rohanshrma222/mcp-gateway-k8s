@@ -1,0 +1,31 @@
+# charts/store - local kind cluster.
+#
+# Everything absent from this file is intentionally inherited from values.yaml. The
+# shorter this file is, the stronger the "same charts, config only" claim.
+
+global:
+  # kind's built-in dynamic provisioner.
+  storageClass: standard
+  # Images are built locally and loaded with `kind load docker-image`, so the node must
+  # not try to pull a tag it already has.
+  imagePullPolicy: IfNotPresent
+
+store:
+  host: store.urumi.local
+
+wordpress:
+  # Load-bearing, not cosmetic. WordPress exposes Application Passwords over plain HTTP
+  # only when wp_get_environment_type() returns `local`, and woo-mcp authenticates to the
+  # WooCommerce REST API with one. Without this the store would need TLS before the MCP
+  # server could talk to it at all.
+  environmentType: local
+
+mariadb:
+  persistence:
+    size: 4Gi
+
+ingress:
+  # No TLS locally: the hostnames are hosts-file entries, so no CA would issue for them
+  # and a self-signed certificate would just add a browser warning to every demo.
+  tls:
+    enabled: false

@@ -1,0 +1,181 @@
+# charts/platform - the control plane. Defaults shared by every environment.
+#
+# Same rule as the other charts: anything true everywhere lives here, and the overlays
+# carry only genuine environment differences.
+
+nameOverride: ''
+fullnameOverride: ''
+
+global:
+  imageRegistry: ''
+  imagePullPolicy: IfNotPresent
+  storageClass: ''
+
+platform:
+  host: app.urumi.local
+
+# -------------------------------------------------------------------- postgres
+
+postgres:
+  image:
+    repository: postgres
+    tag: '18.2-alpine'
+  auth:
+    database: urumi
+    username: urumi
+    existingSecret: ''
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: ''
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: '1', memory: 1Gi }
+  probes:
+    # `pg_isready` reports whether the server will accept a connection. A TCP check would
+    # succeed during recovery, when it will not.
+    readiness:
+      exec: { command: ['sh', '-c', 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'] }
+      periodSeconds: 10
+    liveness:
+      exec: { command: ['sh', '-c', 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'] }
+      periodSeconds: 30
+      failureThreshold: 6
+    startup:
+      exec: { command: ['sh', '-c', 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"'] }
+      periodSeconds: 5
+      failureThreshold: 60
+  securityContext:
+    readOnlyRootFilesystem: false
+    runAsUser: 70
+    runAsGroup: 70
+    fsGroup: 70
+  ports:
+    - name: postgres
+      containerPort: 5432
+
+# --------------------------------------------------------------------- gateway
+
+gateway:
+  image:
+    repository: urumi/gateway
+    tag: dev
+  # Two replicas by default, not as a scaling flourish but to keep the design honest:
+  # the /mcp endpoint is a stateless Streamable HTTP server with no session store, and
+  # running two replicas everywhere means any accidental in-memory session state fails
+  # immediately rather than in production.
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 160Mi }
+    limits: { cpu: '1', memory: 512Mi }
+  probes:
+    # /readyz checks Postgres; /healthz checks only the process. Upstream MCP servers are
+    # deliberately excluded from both - a dead upstream must degrade one server's tools,
+    # not remove the whole gateway from its Service and take the dashboard down with it.
+    readiness:
+      httpGet: { path: /readyz, port: http }
+      periodSeconds: 10
+    liveness:
+      httpGet: { path: /healthz, port: http }
+      periodSeconds: 30
+      failureThreshold: 6
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+  ports:
+    - name: http
+      containerPort: 3000
+  # Keep at least one replica serving during a node drain or a rolling upgrade.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  upstreamProbeIntervalSeconds: 15
+  upstreamTimeoutSeconds: 20
+  rateLimit:
+    enabled: true
+    requestsPerMinute: 120
+  # Hosts the gateway is permitted to register as upstreams. The SSRF guard resolves a
+  # candidate URL's addresses and rejects loopback, private, link-local and CGNAT space;
+  # this allowlist is what re-admits the in-cluster services that are legitimately on
+  # private addresses.
+  upstreamAllowlist:
+    - '*.svc.cluster.local'
+
+# ------------------------------------------------------------------- dashboard
+
+dashboard:
+  image:
+    # Static React build served by nginx-unprivileged, so the web tier runs as a normal
+    # user with a read-only root filesystem.
+    repository: urumi/dashboard
+    tag: dev
+  replicas: 1
+  resources:
+    requests: { cpu: 25m, memory: 48Mi }
+    limits: { cpu: 250m, memory: 128Mi }
+  probes:
+    readiness:
+      httpGet: { path: /, port: http }
+      periodSeconds: 10
+    liveness:
+      httpGet: { path: /, port: http }
+      periodSeconds: 30
+      failureThreshold: 6
+  securityContext:
+    runAsUser: 101
+    runAsGroup: 101
+  ports:
+    - name: http
+      containerPort: 8080
+
+# --------------------------------------------------------------------- ingress
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ''
+    clusterIssuer: ''
+  # Order matters: the two API prefixes must be matched before the dashboard's catch-all,
+  # or every /api call would be answered with the React index.html.
+  paths:
+    - path: /api
+      service: gateway
+      port: http
+    - path: /mcp
+      service: gateway
+      port: http
+    - path: /
+      service: dashboard
+      port: http
+
+# ---------------------------------------------------------------------- secrets
+
+secrets:
+  # Names of the Kubernetes Secrets this chart reads. Nothing in this repo contains a
+  # credential value; these are references.
+  #
+  # - jwt:        signing key for the dashboard session cookie
+  # - encryption: AES-256-GCM key that wraps upstream credentials at rest
+  # - groq:       LLM API key for the chat agent, server-side only
+  # - bootstrap:  the seeded admin and member passwords
+  #
+  # Empty means "generate on first install and keep it": the template uses `lookup` to
+  # reuse the existing Secret on upgrade, so rotating is an explicit act rather than a
+  # side effect of `helm upgrade`.
+  jwtExistingSecret: ''
+  encryptionExistingSecret: ''
+  groqExistingSecret: ''
+  bootstrapExistingSecret: ''
+
+# ---------------------------------------------------------------- networkpolicy
+
+networkPolicy:
+  enabled: true
+
+metrics:
+  # prom-client /metrics on the gateway. No Ingress path: metrics are scraped in-cluster,
+  # and exposing them publicly would leak tool names, user counts and failure rates.
+  enabled: true

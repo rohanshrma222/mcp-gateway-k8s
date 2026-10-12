@@ -1,0 +1,17 @@
+# charts/upstreams - k3s VPS.
+
+global:
+  storageClass: local-path
+  imageRegistry: ghcr.io/rohanshrma222
+  imagePullPolicy: Always
+
+notesMcp:
+  replicas: 2
+  persistence:
+    size: 4Gi
+
+everythingMcp:
+  # Off by default in production. It is a demonstration and test fixture - printEnv and
+  # longRunningOperation are exactly the tools you would not leave registered on a real
+  # deployment - and saying so here is more honest than shipping it and hoping.
+  enabled: false

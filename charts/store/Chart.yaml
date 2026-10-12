@@ -1,0 +1,14 @@
+apiVersion: v2
+name: store
+description: >-
+  One WooCommerce store: MariaDB, WordPress and the WooCommerce MCP server that fronts
+  it. Installed once per store, so a second store is a second release in a second
+  namespace rather than a change to this chart - which is what makes the multi-store
+  bonus additive instead of a rewrite.
+type: application
+version: 0.1.0
+appVersion: '0.1.0'
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: file://../common

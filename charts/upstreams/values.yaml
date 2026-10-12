@@ -1,0 +1,93 @@
+# charts/upstreams - the MCP servers that are not the store.
+#
+# Two of them, chosen to make the hard cases demonstrable rather than theoretical:
+# one we wrote that collides on purpose, and one we did not write at all.
+
+nameOverride: ''
+fullnameOverride: ''
+
+global:
+  imageRegistry: ''
+  imagePullPolicy: IfNotPresent
+  storageClass: ''
+
+# ------------------------------------------------------------------- notes-mcp
+
+notesMcp:
+  enabled: true
+  image:
+    repository: urumi/notes-mcp
+    tag: dev
+  replicas: 1
+  # Exposes add_note, list_notes - and list_products, which collides with the
+  # WooCommerce server's tool of the same name on purpose. A collision that exists only
+  # in a design document is not a demonstration; this one makes the
+  # <serverSlug>__<toolName> scheme something that can be shown working.
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 192Mi }
+  probes:
+    readiness:
+      httpGet: { path: /readyz, port: http }
+      periodSeconds: 10
+    liveness:
+      httpGet: { path: /healthz, port: http }
+      periodSeconds: 30
+      failureThreshold: 6
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    # Writes a SQLite file to its PVC, and nowhere else.
+    readOnlyRootFilesystem: true
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ''
+  ports:
+    - name: http
+      containerPort: 3000
+
+# -------------------------------------------------------------- everything-mcp
+
+everythingMcp:
+  enabled: true
+  image:
+    # A pinned Dockerfile around @modelcontextprotocol/server-everything rather than a
+    # third-party image: there is no official, trustworthy `mcp/everything` image, and
+    # building our own keeps the supply chain ours while still giving us a server we did
+    # not write.
+    repository: urumi/everything-mcp
+    tag: dev
+  replicas: 1
+  # Earns its place by being awkward: longRunningOperation is a real timeout demo, and
+  # printEnv is a real credential-leak test - it proves the gateway never forwards a
+  # client's token or its own environment to an upstream.
+  resources:
+    requests: { cpu: 25m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 192Mi }
+  probes:
+    readiness:
+      httpGet: { path: /readyz, port: http }
+      periodSeconds: 10
+    liveness:
+      httpGet: { path: /healthz, port: http }
+      periodSeconds: 30
+      failureThreshold: 6
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+  ports:
+    - name: http
+      containerPort: 3000
+
+# ---------------------------------------------------------------- networkpolicy
+
+networkPolicy:
+  enabled: true
+  # Neither server has an Ingress, and both accept traffic only from the gateway's pods.
+  # The selector is by label, not by address, so rescheduling cannot quietly open or
+  # close the path.
+  gatewayPodLabels:
+    app.kubernetes.io/name: platform
+    app.kubernetes.io/component: gateway
+  gatewayNamespace: urumi-platform

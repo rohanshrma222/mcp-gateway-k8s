@@ -1,0 +1,9 @@
+# charts/upstreams - local kind cluster.
+
+global:
+  storageClass: standard
+  imagePullPolicy: IfNotPresent
+
+notesMcp:
+  persistence:
+    size: 1Gi
