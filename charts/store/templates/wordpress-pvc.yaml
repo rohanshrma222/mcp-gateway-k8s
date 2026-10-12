@@ -1,0 +1,36 @@
+{{- if not .Values.wordpress.persistence.enabled }}
+{{- fail "wordpress.persistence.enabled must be true: wp-content requires a PersistentVolumeClaim (plugins, themes and uploads)" }}
+{{- end }}
+{{/*
+wp-content only - not all of /var/www/html.
+
+This is the decision that keeps WordPress upgradeable. Core lives in the image, so bumping
+the image tag actually upgrades WordPress; persisting the whole document root would pin
+core at whatever version first populated the volume and turn every future upgrade into a
+manual migration. What genuinely needs to survive a restart is what the site owner added:
+plugins, themes and uploads. That is wp-content.
+
+The consequence to know about: mounting a volume over wp-content hides the copy baked into
+the image. The official entrypoint handles it - on first start it copies its source tree
+into the document root, and because wp-content is a mount point those files land on this
+volume, so the default themes are present. It is worth knowing because an empty wp-content
+with no theme is a white screen, not an error message.
+
+resource-policy: keep - a `helm uninstall` should not destroy uploads. Consistent with the
+MariaDB PVC, which StatefulSets retain by default anyway.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "store.wordpress.name" . }}-content
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "wordpress") | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- include "common.storageClassName" (dict "root" $ "spec" .Values.wordpress) | nindent 2 }}
+  resources:
+    requests:
+      storage: {{ .Values.wordpress.persistence.size | required "wordpress.persistence.size is required" }}

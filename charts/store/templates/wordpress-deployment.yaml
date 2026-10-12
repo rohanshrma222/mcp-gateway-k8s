@@ -1,0 +1,190 @@
+{{- $ctx := dict "root" $ "component" "wordpress" "spec" .Values.wordpress }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "store.wordpress.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ .Values.wordpress.replicas }}
+  # Recreate, not RollingUpdate, and this is forced by the storage rather than chosen.
+  # The wp-content PVC is ReadWriteOnce, so it can be mounted by one node at a time. A
+  # rolling update starts the new pod before terminating the old one, and the new pod
+  # would sit in Pending with a FailedAttachVolume event - an upgrade that hangs rather
+  # than one that fails. Recreate accepts a few seconds of downtime instead. Production
+  # with an RWX volume can switch this back.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      initContainers:
+        # Stages WordPress core into an emptyDir so the main container's entrypoint finds
+        # it already there and skips its own copy.
+        #
+        # This exists because of a real crash loop. The official image copies
+        # /usr/src/wordpress into the document root with tar, and tar sets the mode of
+        # every directory it extracts - including ./wp-content, which here is a mounted
+        # volume. A mounted volume's directory is owned by root even with fsGroup set
+        # (fsGroup changes the group, not the owner), and chmod is only permitted to the
+        # owner. So as uid 33 the copy died with:
+        #
+        #   tar: ./wp-content: Cannot change mode to rwxrwxrwx: Operation not permitted
+        #
+        # The two obvious fixes are both worse. Running WordPress as root is what most
+        # charts do, and it turns the largest attack surface in this project - a PHP
+        # application with plugins - into a root process. Adding a root initContainer to
+        # chown the volume keeps a root container in the pod for no structural reason.
+        #
+        # Staging core instead removes the conflict rather than working around it: the
+        # entrypoint's copy never runs, so nothing ever tries to chmod the mount point,
+        # and no container in this pod runs as root. The cost is re-copying core on every
+        # pod start, which is what the image already did into its own filesystem - so
+        # not a regression, just a different destination.
+        - name: stage-wordpress-core
+          image: {{ include "common.image" $ctx | quote }}
+          imagePullPolicy: {{ include "common.imagePullPolicy" $ctx }}
+          {{- include "common.containerSecurityContext" $ctx | nindent 10 }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              if [ -f /staged/wp-includes/version.php ]; then
+                echo "core already staged"
+                exit 0
+              fi
+              # wp-content is excluded deliberately: it is a separate mount in the main
+              # container, so copying it here would only be hidden by that mount. The
+              # bootstrap Job puts a theme on the real volume.
+              tar -C /usr/src/wordpress --exclude=./wp-content -cf - . | tar -C /staged -xf -
+              mkdir -p /staged/wp-content
+              echo "staged WordPress $(sed -n "s/^\$wp_version = '\(.*\)';/\1/p" /staged/wp-includes/version.php)"
+          volumeMounts:
+            - name: wp-core
+              mountPath: /staged
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: '1', memory: 256Mi }
+        # Step 2.5. WordPress does not retry a failed database connection at startup - it
+        # renders "Error establishing a database connection" and keeps serving that page
+        # until something restarts it. Without this the pod would come up before MariaDB
+        # and need a manual kick on every cold start of the cluster.
+        #
+        # It is a retry loop rather than a single check because the MariaDB Service is
+        # headless with publishNotReadyAddresses false: the name does not resolve at all
+        # until the database is ready, so early attempts fail with NXDOMAIN rather than a
+        # refused connection. A one-shot port check would fail instantly and look like a
+        # networking fault.
+        #
+        # It authenticates rather than only probing the port, because "the port is open"
+        # and "my credentials work against my database" are different claims, and only the
+        # second is what WordPress actually needs.
+        - name: wait-for-mariadb
+          image: {{ include "common.image" (dict "root" $ "component" "mariadb" "spec" .Values.mariadb) | quote }}
+          imagePullPolicy: {{ include "common.imagePullPolicy" (dict "root" $ "component" "mariadb" "spec" .Values.mariadb) }}
+          {{- include "common.containerSecurityContext" $ctx | nindent 10 }}
+          command:
+            - sh
+            - -c
+            - |
+              until mariadb -h "$DB_HOST" -u"$DB_USER" -p"$DB_PASSWORD" -e 'SELECT 1' >/dev/null 2>&1; do
+                echo "waiting for $DB_HOST ..."
+                sleep 2
+              done
+              echo "database reachable and credentials accepted"
+          env:
+            - name: DB_HOST
+              value: {{ include "store.mariadb.name" . | quote }}
+            - name: DB_USER
+              value: {{ .Values.mariadb.auth.username | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.mariadb.secretName" . }}
+                  key: mariadb-password
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      containers:
+        - name: wordpress
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            - name: WORDPRESS_DB_HOST
+              value: {{ include "store.mariadb.name" . | quote }}
+            - name: WORDPRESS_DB_NAME
+              value: {{ .Values.mariadb.auth.database | quote }}
+            - name: WORDPRESS_DB_USER
+              value: {{ .Values.mariadb.auth.username | quote }}
+            - name: WORDPRESS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.mariadb.secretName" . }}
+                  key: mariadb-password
+            - name: WORDPRESS_TABLE_PREFIX
+              value: {{ .Values.wordpress.tablePrefix | quote }}
+            {{- range $key := list "auth-key" "secure-auth-key" "logged-in-key" "nonce-key" "auth-salt" "secure-auth-salt" "logged-in-salt" "nonce-salt" }}
+            - name: WORDPRESS_{{ $key | upper | replace "-" "_" }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.wordpress.secretName" $ }}
+                  key: {{ $key }}
+            {{- end }}
+            # Read by wp_get_environment_type(). Also defined as a constant below, because
+            # the constant is the documented form and wins; this env var is for anything
+            # that shells into the container, such as wp-cli.
+            - name: WP_ENVIRONMENT_TYPE
+              value: {{ .Values.wordpress.environmentType | quote }}
+            - name: WORDPRESS_CONFIG_EXTRA
+              value: |
+                {{/* WP_HOME and WP_SITEURL are pinned to the ingress host rather than
+                     left to the database. WordPress stores siteurl in the options table
+                     at install time, and if a request's Host header disagrees with it,
+                     WordPress answers with a 301 to the stored value - so an in-cluster
+                     call to the Service name gets redirected to the public URL, which
+                     woo-mcp cannot follow. Pinning them in config makes the host a
+                     property of the deployment rather than of whatever first wrote the
+                     database. */}}
+                define('WP_HOME',    '{{ include "store.scheme" . }}://{{ include "store.host" . }}');
+                define('WP_SITEURL', '{{ include "store.scheme" . }}://{{ include "store.host" . }}');
+                {{/* Load-bearing for stage 3, not cosmetic. WordPress offers Application
+                     Passwords over a plain HTTP connection only when this is 'local'
+                     (wp_is_application_passwords_available). woo-mcp authenticates to the
+                     WooCommerce REST API with one, so without this the entire MCP layer
+                     would need TLS inside the cluster before it could make a single call.
+                     values-prod.yaml sets this to 'production' and terminates TLS at the
+                     ingress. */}}
+                define('WP_ENVIRONMENT_TYPE', '{{ .Values.wordpress.environmentType }}');
+                {{/* Trust the ingress controller's forwarded scheme. Without it WordPress
+                     sees a plain HTTP request from Traefik, builds http:// URLs, and the
+                     browser blocks them as mixed content on an https page. */}}
+                if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                  $_SERVER['HTTPS'] = 'on';
+                }
+                {{/* The plugin and theme editors execute arbitrary PHP from a browser
+                     form. Nothing in this deployment needs them, and the filesystem is
+                     managed by Helm and the bootstrap Job. */}}
+                define('DISALLOW_FILE_EDIT', true);
+          volumeMounts:
+            # Core, staged by the initContainer. Ephemeral on purpose: WordPress is
+            # upgraded by changing the image tag, not by migrating a volume.
+            - name: wp-core
+              mountPath: /var/www/html
+            # Mounted inside the staged core, hiding its empty wp-content. This is the
+            # only thing that survives a restart: plugins, themes and uploads.
+            - name: wp-content
+              mountPath: /var/www/html/wp-content
+      volumes:
+        - name: wp-core
+          emptyDir: {}
+        - name: wp-content
+          persistentVolumeClaim:
+            claimName: {{ include "store.wordpress.name" . }}-content

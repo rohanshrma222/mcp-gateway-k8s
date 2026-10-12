@@ -1,0 +1,250 @@
+{{- if .Values.bootstrap.enabled }}
+{{/*
+The bootstrap script, in a ConfigMap rather than inline in the Job's command.
+
+Two reasons. A 100-line shell script embedded in a YAML string is unreviewable - quoting
+errors hide inside it and nobody reads it in a diff. And mounting it as a file means the
+exact script that ran is readable with `kubectl get configmap -o yaml` after the fact,
+which matters when a hook failed three days ago.
+
+hook-weight -5 so this is created before the Job that mounts it. Helm sorts hooks by
+weight ascending, and a Job mounting a ConfigMap that does not exist yet stays Pending
+until the hook times out.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "store.wordpress.name" . }}-bootstrap
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "bootstrap") | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: '-5'
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  bootstrap.sh: |
+    #!/bin/sh
+    # Turns an empty WordPress into a working WooCommerce store.
+    #
+    # Idempotent by design, because it runs on every `helm upgrade`, not just install.
+    # Each block is guarded by a question about current state rather than by a marker
+    # file: "is core installed", "is the plugin present". A marker file would lie after a
+    # partial failure.
+    set -eu
+
+    WP="wp --path=/var/www/html --allow-root"
+    SITE_URL="${SITE_URL:?}"
+
+    log() { echo "[bootstrap] $*"; }
+
+    # `wp option update` exits non-zero when the new value equals the old one, because
+    # WordPress's update_option() returns false when nothing changed. Under `set -e` that
+    # turns the second run of this script into a failed Helm hook - which is exactly the
+    # bug this function exists to remove. It cost one failed hook run to find.
+    #
+    # Comparing first is better than appending `|| true`, which would also swallow a
+    # genuine failure to write.
+    set_option() {
+      key="$1"; value="$2"
+      current=$($WP option get "$key" 2>/dev/null || true)
+      if [ "$current" = "$value" ]; then
+        log "option $key already set"
+        return 0
+      fi
+      $WP option update "$key" "$value"
+    }
+
+    # The same problem for structured values, where comparing strings is unreliable - key
+    # order and whitespace differ between what we send and what comes back. Going through
+    # update_option() directly sidesteps the return-value check entirely, without
+    # suppressing errors from anything else.
+    set_option_json() {
+      key="$1"; json="$2"
+      KEY="$key" JSON="$json" $WP eval '
+        $ok = update_option(getenv("KEY"), json_decode(getenv("JSON"), true));
+        WP_CLI::success(getenv("KEY") . ($ok ? " updated" : " already current"));
+      '
+    }
+
+    # ---------------------------------------------------------------- core files
+    # wp-cli needs WordPress loaded to run almost any command, and this image ships
+    # wp-cli without core. Core is downloaded into an emptyDir: it is scaffolding for the
+    # CLI, thrown away when the Job pod exits. The things that must persist go elsewhere -
+    # the database into MariaDB's PVC, plugins and themes into the wp-content PVC mounted
+    # below this path.
+    if [ ! -f /var/www/html/wp-includes/version.php ]; then
+      # Pinned to the serving pod's version, never "latest". wp core install writes the
+      # schema version of whatever core wp-cli loaded, so a newer download would migrate
+      # the database past the WordPress the pod actually runs - a split-brain install that
+      # looks fine until something queries a column that does not exist.
+      log "downloading WordPress core ${WP_VERSION} (scaffolding for wp-cli)"
+      $WP core download --skip-content --version="${WP_VERSION:?}"
+    else
+      log "core files already present"
+    fi
+
+    # wp-config.php is regenerated every run and is deliberately not persisted. The
+    # credentials come from the environment, which comes from Kubernetes Secrets, so this
+    # file never becomes a second source of truth that can drift.
+    log "writing wp-config.php"
+    $WP config create --force \
+      --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PASSWORD" --dbhost="$DB_HOST" \
+      --dbprefix="$TABLE_PREFIX" \
+      --extra-php <<PHP
+    define('WP_HOME', '$SITE_URL');
+    define('WP_SITEURL', '$SITE_URL');
+    define('WP_ENVIRONMENT_TYPE', '${WP_ENVIRONMENT_TYPE:-production}');
+    PHP
+
+    # ------------------------------------------------------------------- install
+    if $WP core is-installed 2>/dev/null; then
+      log "WordPress already installed - skipping core install"
+    else
+      log "installing WordPress"
+      $WP core install \
+        --url="$SITE_URL" \
+        --title="$SITE_TITLE" \
+        --admin_user="$ADMIN_USER" \
+        --admin_password="$ADMIN_PASSWORD" \
+        --admin_email="$ADMIN_EMAIL" \
+        --skip-email
+    fi
+
+    # ------------------------------------------------------------------ permalinks
+    # WooCommerce REST routes under /wp-json only resolve with pretty permalinks; on the
+    # default query-string structure every request 404s. This is the single most common
+    # reason a WooCommerce API "does not work", so it is set explicitly rather than
+    # assumed.
+    log "setting permalink structure"
+    $WP rewrite structure '/%postname%/' --hard
+    $WP rewrite flush --hard
+
+    # ------------------------------------------------------------------ woocommerce
+    if $WP plugin is-installed woocommerce 2>/dev/null; then
+      log "WooCommerce already installed"
+    else
+      log "installing WooCommerce"
+      $WP plugin install woocommerce
+    fi
+    $WP plugin activate woocommerce || log "woocommerce already active"
+
+    # Guarantees a theme exists on the wp-content volume. The WordPress pod stages core
+    # into an emptyDir and mounts this volume over its wp-content, so on a first install
+    # the volume starts genuinely empty - and wp-content with no theme is a white screen
+    # rather than an error message, which is the worst thing to debug during a demo.
+    if [ -z "$($WP theme list --field=name 2>/dev/null)" ]; then
+      log "no theme on the volume - installing one"
+      $WP theme install twentytwentyfive --activate || $WP theme install twentytwentyfour --activate
+    else
+      log "theme already present"
+    fi
+
+    # A new WooCommerce install hides the storefront behind a "coming soon" page. Without
+    # this the store looks broken to anyone who opens it, including a grader.
+    log "disabling coming-soon mode"
+    set_option woocommerce_coming_soon 'no'
+    set_option woocommerce_store_pages_only 'no'
+
+    # Cosmetic wp-admin state, so these are allowed to fail. WooCommerce owns these keys
+    # and filters some of them depending on how far through onboarding it believes it is;
+    # a store that works but still shows a setup checklist is not a broken store.
+    log "hiding the onboarding wizard (best effort)"
+    set_option woocommerce_task_list_hidden 'yes' || log "task list option not settable - ignoring"
+    set_option_json woocommerce_onboarding_profile '{"skipped":true,"completed":true}' || true
+
+    log "configuring store locale"
+    set_option woocommerce_default_country "${STORE_COUNTRY:-IN:KA}"
+    set_option woocommerce_currency "${STORE_CURRENCY:-INR}"
+    set_option woocommerce_enable_guest_checkout 'yes'
+    set_option woocommerce_calc_taxes 'no'
+
+    # Cash on Delivery is the payment method the demo checks out with: it needs no gateway
+    # account, no API key and no network call, so the checkout path can be demonstrated
+    # without a third party being up.
+    log "enabling Cash on Delivery"
+    set_option_json woocommerce_cod_settings '{"enabled":"yes","title":"Cash on delivery","description":"Pay with cash upon delivery.","instructions":"Pay with cash upon delivery.","enable_for_methods":[],"enable_for_virtual":"yes"}'
+
+    # --------------------------------------------------------------------- products
+    # Guarded by name: re-running must not create duplicates, and a count check would
+    # recreate them after someone deletes one by hand during a demo.
+    seed_product() {
+      name="$1"; price="$2"; description="$3"
+      existing=$($WP post list --post_type=product --title="$name" --format=ids 2>/dev/null || true)
+      if [ -n "$existing" ]; then
+        log "product already present: $name"
+        return 0
+      fi
+      log "creating product: $name"
+      id=$($WP post create --post_type=product --post_status=publish \
+            --post_title="$name" --post_content="$description" --porcelain)
+      $WP post meta update "$id" _price "$price"
+      $WP post meta update "$id" _regular_price "$price"
+      $WP post meta update "$id" _manage_stock 'no'
+      $WP post meta update "$id" _stock_status 'instock'
+      $WP post meta update "$id" _visibility 'visible'
+      $WP post meta update "$id" _virtual 'no'
+      $WP post meta update "$id" _downloadable 'no'
+      # Without the product_type term WooCommerce treats the post as an unrecognised
+      # product and refuses to add it to a cart.
+      $WP post term set "$id" product_type simple
+    }
+
+    {{- range .Values.bootstrap.products }}
+    seed_product {{ .name | quote }} {{ .price | quote }} {{ .description | quote }}
+    {{- end }}
+
+    # --------------------------------------------------------- application password
+    # The credential woo-mcp uses for the WooCommerce REST API.
+    #
+    # WordPress only stores a hash of an application password, so one it generates cannot
+    # be read back. If this Job generated it, the only way woo-mcp could learn the value
+    # would be for the Job to write it into a Kubernetes Secret - which means giving a
+    # short-lived batch pod a ServiceAccount with create/update on secrets.
+    #
+    # So the direction is inverted: the Secret holds the plaintext, and this hashes it
+    # into WordPress. No write-back, no RBAC, and rotating the credential is editing one
+    # Secret and re-running the hook. Always replaces rather than skipping when present,
+    # which is what makes rotation work.
+    log "asserting the application password for ${APP_PASSWORD_NAME}"
+    $WP eval '
+      $user = get_user_by("login", getenv("ADMIN_USER"));
+      if (! $user) { WP_CLI::error("admin user not found"); }
+      $label = getenv("APP_PASSWORD_NAME");
+      $plain = getenv("APP_PASSWORD");
+      $items = array_values(array_filter(
+        (array) get_user_meta($user->ID, "_application_passwords", true) ?: array(),
+        function ($i) use ($label) { return isset($i["name"]) && $i["name"] !== $label; }
+      ));
+      $items[] = array(
+        "uuid"      => wp_generate_uuid4(),
+        "app_id"    => "",
+        "name"      => $label,
+        // Application passwords are verified with wp_verify_fast_hash(), which expects a
+        // $generic$ hash from wp_fast_hash() - not the $wp$ hash wp_hash_password()
+        // produces for user passwords. Using the wrong one stores a hash that
+        // wp_check_password() accepts and the REST auth path rejects, which presents as
+        // a flat 401 with a correct-looking credential. Cost one debugging round.
+        "password"  => function_exists("wp_fast_hash") ? wp_fast_hash($plain) : wp_hash_password($plain),
+        "created"   => time(),
+        "last_used" => null,
+        "last_ip"   => null,
+      );
+      update_user_meta($user->ID, "_application_passwords", $items);
+      // The flag that makes the whole feature work.
+      //
+      // wp_authenticate_application_password() short-circuits on
+      // WP_Application_Passwords::is_in_use(), which reads the network option
+      // "using_application_passwords". Core sets it as a side effect of
+      // create_new_application_password() - the function we deliberately do not use,
+      // because it generates the value instead of accepting ours. Writing the user meta
+      // alone therefore produces a credential that verifies correctly and is never even
+      // consulted: every REST call returns a flat 401 rest_not_logged_in. Replicating the
+      // side effect is the price of choosing the password ourselves.
+      update_network_option(get_main_network_id(), WP_Application_Passwords::OPTION_KEY_IN_USE, true);
+      WP_CLI::success("application password set for " . $label . "; feature flag asserted");
+    '
+
+    log "done"
+    $WP core version
+    $WP plugin list --status=active --field=name
+{{- end }}

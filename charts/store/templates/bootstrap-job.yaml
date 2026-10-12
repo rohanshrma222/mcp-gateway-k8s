@@ -1,0 +1,142 @@
+{{- if .Values.bootstrap.enabled }}
+{{- $ctx := dict "root" $ "component" "bootstrap" "spec" .Values.bootstrap }}
+{{/*
+Step 2.4 - the Helm hook that makes the store a store.
+
+A post-install AND post-upgrade hook, deliberately both. Install-only would mean the
+store is configured exactly once and any later change to products, payment settings or
+the application password needs a manual kick. Running on every upgrade is only safe
+because the script is idempotent, which is why every block in it is guarded by a question
+about current state.
+
+hook-delete-policy: before-hook-creation, not hook-succeeded. A Job object cannot be
+patched in place, so leaving the previous one behind makes the next upgrade fail with
+"field is immutable"; deleting on success would throw away the logs of the run that just
+configured the store. Deleting the old Job immediately before creating the new one keeps
+the most recent run inspectable with `kubectl logs job/...` while still letting upgrades
+through.
+
+This container uses common.jobContainerDefaults rather than common.containerDefaults: a
+Job has nowhere to put probes - readiness is meaningless for a pod expected to exit, and
+a liveness probe would restart work that is running correctly. Resources and the hardened
+securityContext still apply.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "store.wordpress.name" . }}-bootstrap
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: '0'
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.bootstrap.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      initContainers:
+        # The same wait as the WordPress pod, for the same reason and with the same retry
+        # loop. The hook can start before MariaDB is serving, and wp-cli would fail its
+        # first command rather than wait.
+        - name: wait-for-mariadb
+          image: {{ include "common.image" (dict "root" $ "component" "mariadb" "spec" .Values.mariadb) | quote }}
+          imagePullPolicy: {{ include "common.imagePullPolicy" (dict "root" $ "component" "mariadb" "spec" .Values.mariadb) }}
+          {{- include "common.containerSecurityContext" $ctx | nindent 10 }}
+          command:
+            - sh
+            - -c
+            - |
+              until mariadb -h "$DB_HOST" -u"$DB_USER" -p"$DB_PASSWORD" -e 'SELECT 1' >/dev/null 2>&1; do
+                echo "waiting for $DB_HOST ..."
+                sleep 2
+              done
+          env:
+            - name: DB_HOST
+              value: {{ include "store.mariadb.name" . | quote }}
+            - name: DB_USER
+              value: {{ .Values.mariadb.auth.username | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.mariadb.secretName" . }}
+                  key: mariadb-password
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 128Mi }
+      containers:
+        - name: bootstrap
+          {{- include "common.jobContainerDefaults" $ctx | nindent 10 }}
+          command: ['sh', '/scripts/bootstrap.sh']
+          env:
+            - name: SITE_URL
+              value: {{ printf "%s://%s" (include "store.scheme" .) (include "store.host" .) | quote }}
+            - name: SITE_TITLE
+              value: {{ .Values.wordpress.title | quote }}
+            - name: WP_ENVIRONMENT_TYPE
+              value: {{ .Values.wordpress.environmentType | quote }}
+            # Derived from the image tag rather than configured separately, so the hook
+            # cannot drift from the pod it is configuring. Tag "6.9.1-php8.4-apache"
+            # yields "6.9.1"; set wordpress.coreVersion to override.
+            - name: WP_VERSION
+              value: {{ .Values.wordpress.coreVersion | default (.Values.wordpress.image.tag | splitList "-" | first) | quote }}
+            - name: TABLE_PREFIX
+              value: {{ .Values.wordpress.tablePrefix | quote }}
+            - name: DB_HOST
+              value: {{ include "store.mariadb.name" . | quote }}
+            - name: DB_NAME
+              value: {{ .Values.mariadb.auth.database | quote }}
+            - name: DB_USER
+              value: {{ .Values.mariadb.auth.username | quote }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.mariadb.secretName" . }}
+                  key: mariadb-password
+            - name: ADMIN_USER
+              value: {{ .Values.wordpress.auth.adminUser | quote }}
+            - name: ADMIN_EMAIL
+              value: {{ .Values.wordpress.auth.adminEmail | quote }}
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.wordpress.secretName" . }}
+                  key: wordpress-admin-password
+            # wp-cli writes its download cache under $HOME; without this it warns
+            # "Failed to create directory '/.wp-cli/cache/'" on every plugin install.
+            - name: HOME
+              value: /tmp
+            - name: APP_PASSWORD_NAME
+              value: {{ .Values.wordpress.appPasswordName | quote }}
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.wordpress.secretName" . }}
+                  key: wordpress-app-password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+            # Core goes here and is discarded with the pod - it is scaffolding for wp-cli.
+            - name: wp-core
+              mountPath: /var/www/html
+            # wp-content is the real PVC, mounted inside that scaffolding, so plugins and
+            # themes installed by this Job land on the volume the WordPress pod serves.
+            - name: wp-content
+              mountPath: /var/www/html/wp-content
+      volumes:
+        - name: scripts
+          configMap:
+            name: {{ include "store.wordpress.name" . }}-bootstrap
+            defaultMode: 0555
+        - name: wp-core
+          emptyDir: {}
+        - name: wp-content
+          persistentVolumeClaim:
+            claimName: {{ include "store.wordpress.name" . }}-content
+{{- end }}

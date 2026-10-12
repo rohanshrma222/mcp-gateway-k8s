@@ -1,0 +1,25 @@
+{{/*
+A normal ClusterIP Service, unlike MariaDB's headless one.
+
+WordPress is not a StatefulSet and has no per-pod identity worth addressing, so a virtual
+IP is the right shape: the Ingress and woo-mcp both talk to a stable address that does not
+change when the pod is replaced. Only ready pods appear in its endpoints, so a request
+cannot be routed to a WordPress that is still waiting on its database.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "store.wordpress.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "wordpress") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    {{- range .Values.wordpress.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "wordpress") | nindent 4 }}

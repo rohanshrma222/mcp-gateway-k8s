@@ -35,3 +35,17 @@ in-cluster request comes back as a 301 to the public URL.
 {{- printf "%s-mariadb" (include "common.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "store.wordpress.secretName" -}}
+{{- if .Values.wordpress.auth.existingSecret -}}
+{{- .Values.wordpress.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-wordpress" (include "common.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Scheme for WP_HOME / WP_SITEURL. WordPress builds every absolute URL from this, so
+     getting it wrong behind TLS produces mixed-content pages rather than an error. */}}
+{{- define "store.scheme" -}}
+{{- if .Values.ingress.tls.enabled -}}https{{- else -}}http{{- end -}}
+{{- end -}}

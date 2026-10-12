@@ -1,0 +1,51 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+Step 2.3 - the storefront's stable URL.
+
+A plain networking.k8s.io/v1 Ingress with ingressClassName, so nothing here is
+Traefik-specific: swapping the controller is a values change, not a rewrite. Locally
+Traefik claims it; on the k3s VPS Traefik claims it too, because k3s installs Traefik by
+default. Same object, same class name, both environments.
+
+Note what is absent: there is no Ingress for woo-mcp anywhere in this chart. "Unreachable
+from outside the cluster" is a property of an object that does not exist rather than a
+rule someone has to remember to maintain - which is a stronger guarantee than any
+annotation, and the reason this file only ever mentions WordPress.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "store.wordpress.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "wordpress") | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className | required "ingress.className is required" }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ include "store.host" . | quote }}
+      {{/* cert-manager watches this Ingress, sees the clusterIssuer annotation and
+           populates this Secret. It does not exist at install time, and that is expected:
+           Traefik serves a default certificate until the order completes. */}}
+      secretName: {{ .Values.ingress.tls.secretName | required "ingress.tls.secretName is required when TLS is enabled" }}
+  {{- end }}
+  rules:
+    - host: {{ include "store.host" . | quote }}
+      http:
+        paths:
+          {{/* Prefix on / rather than a set of specific paths. WordPress owns the whole
+               host: permalinks are arbitrary, wp-admin and wp-json are both under it, and
+               enumerating paths here would mean a 404 from the router for any URL
+               structure someone changes in wp-admin later. */}}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "store.wordpress.name" . }}
+                port:
+                  name: http
+{{- end }}
