@@ -1,18 +1,19 @@
 {{/*
-Chart-local names. Everything generic lives in charts/common; this file only holds what
-is specific to a store release.
+Chart-local names. Everything generic lives in charts/common; this file holds only what is
+specific to a store release. All of these take the root context directly: `include
+"store.mariadb.name" $`.
 */}}
 
 {{- define "store.mariadb.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "mariadb") -}}
+{{- include "common.componentName" (dict "root" . "component" "mariadb") -}}
 {{- end -}}
 
 {{- define "store.wordpress.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "wordpress") -}}
+{{- include "common.componentName" (dict "root" . "component" "wordpress") -}}
 {{- end -}}
 
 {{- define "store.wooMcp.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "woo-mcp") -}}
+{{- include "common.componentName" (dict "root" . "component" "woo-mcp") -}}
 {{- end -}}
 
 {{/*

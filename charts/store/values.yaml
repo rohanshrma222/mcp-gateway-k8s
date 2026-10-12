@@ -47,28 +47,47 @@ mariadb:
     requests: { cpu: 100m, memory: 512Mi }
     limits: { cpu: '1', memory: 1Gi }
   probes:
-    # `mysqladmin ping` answers once the server accepts connections, which is the only
-    # thing a dependent cares about. A TCP check would pass while the server was still
-    # replaying its redo log.
+    # The official MariaDB image ships /usr/local/bin/healthcheck.sh, and it is a better
+    # answer than the usual `mariadb-admin ping` for two reasons.
+    #
+    # --innodb_initialized is the one that matters: a plain ping answers as soon as the
+    # server is listening, which is true while InnoDB is still replaying its redo log and
+    # the database is not yet usable. Readiness that goes green too early hands traffic
+    # to a server that will reject it.
+    #
+    # And it needs no password on the command line. `mariadb-admin ping -p"$PASS"` puts
+    # the root password in the process list on every probe interval. Here
+    # MARIADB_MYSQL_LOCALHOST_USER=1 creates a mysql@localhost user with USAGE only, and
+    # healthcheck.sh connects over the unix socket as that user - no credential, and no
+    # privilege to misuse if one leaked.
     readiness:
       exec:
-        command: ['sh', '-c', 'mariadb-admin ping -u root -p"$MARIADB_ROOT_PASSWORD"']
+        command: ['healthcheck.sh', '--connect', '--innodb_initialized']
       periodSeconds: 10
       timeoutSeconds: 5
+    # Liveness is deliberately weaker than readiness: --connect only. Liveness failure
+    # restarts the container, so it must answer "is this process wedged?" and nothing
+    # more. If liveness also required InnoDB to be initialised, a long crash recovery
+    # would be interrupted by a restart, which starts the recovery over - a loop that
+    # looks like a corrupt database and is actually a probe bug.
     liveness:
       exec:
-        command: ['sh', '-c', 'mariadb-admin ping -u root -p"$MARIADB_ROOT_PASSWORD"']
+        command: ['healthcheck.sh', '--connect']
       periodSeconds: 30
       timeoutSeconds: 5
       failureThreshold: 6
     # First boot initialises the data directory, which is far slower than steady state.
-    # Without this, the liveness timeout would have to be long enough to cover first run
-    # and would then be useless for detecting a wedged server later.
+    # Without a startup probe the liveness timeout would have to be long enough to cover
+    # first run, and would then be useless for detecting a wedged server later. 60 x 5s
+    # gives first-run initialisation five minutes before anything is restarted.
     startup:
       exec:
-        command: ['sh', '-c', 'mariadb-admin ping -u root -p"$MARIADB_ROOT_PASSWORD"']
+        command: ['healthcheck.sh', '--connect', '--innodb_initialized']
       periodSeconds: 5
       failureThreshold: 60
+  ports:
+    - name: mysql
+      containerPort: 3306
   securityContext:
     # The entrypoint takes ownership of the data directory on first run, so the root
     # filesystem cannot be read-only here. Stated in values rather than hidden in a

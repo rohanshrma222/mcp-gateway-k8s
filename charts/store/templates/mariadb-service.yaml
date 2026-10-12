@@ -1,0 +1,36 @@
+{{/*
+Headless Service.
+
+`clusterIP: None` is required by the StatefulSet: it is what gives the pod a stable DNS
+name (<name>-0.<service>.<ns>.svc.cluster.local) that survives rescheduling onto another
+node with a different pod IP.
+
+Clients - WordPress, and the woo-mcp initContainer - use this same Service rather than a
+second ClusterIP Service in front of it. With one replica a virtual IP would add an
+indirection and buy nothing; if a read replica is ever added, that is the point at which a
+separate read Service earns its place.
+
+publishNotReadyAddresses is deliberately left at false. It means this name does not
+resolve at all until MariaDB passes its readiness probe, so a client cannot connect to a
+server that is still replaying its redo log. The consequence is that the waiting
+initContainer in step 2.5 sees NXDOMAIN rather than a refused connection, which is why it
+has to be a retry loop and not a single check.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "store.mariadb.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "mariadb") | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    {{- range .Values.mariadb.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "mariadb") | nindent 4 }}

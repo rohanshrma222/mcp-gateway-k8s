@@ -1,17 +1,17 @@
 {{/*
-Chart-local names for the control plane.
+Chart-local names for the control plane. All take the root context directly.
 */}}
 
 {{- define "platform.postgres.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "postgres") -}}
+{{- include "common.componentName" (dict "root" . "component" "postgres") -}}
 {{- end -}}
 
 {{- define "platform.gateway.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "gateway") -}}
+{{- include "common.componentName" (dict "root" . "component" "gateway") -}}
 {{- end -}}
 
 {{- define "platform.dashboard.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "dashboard") -}}
+{{- include "common.componentName" (dict "root" . "component" "dashboard") -}}
 {{- end -}}
 
 {{- define "platform.postgres.secretName" -}}
@@ -20,15 +20,4 @@ Chart-local names for the control plane.
 {{- else -}}
 {{- printf "%s-postgres" (include "common.fullname" .) -}}
 {{- end -}}
-{{- end -}}
-
-{{/*
-Postgres connection URL, assembled in the chart rather than stored anywhere.
-
-Deliberately built from the Secret's parts at pod start (as separate env vars consumed by
-the app) rather than written into a ConfigMap as one string - a DSN in a ConfigMap is a
-password in plaintext in the API server, readable by anyone with get on configmaps.
-*/}}
-{{- define "platform.postgres.host" -}}
-{{- include "platform.postgres.name" (dict "root" .) -}}
 {{- end -}}

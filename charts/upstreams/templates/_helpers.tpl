@@ -1,11 +1,11 @@
 {{/*
-Chart-local names for the extra MCP servers.
+Chart-local names for the extra MCP servers. All take the root context directly.
 */}}
 
 {{- define "upstreams.notesMcp.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "notes-mcp") -}}
+{{- include "common.componentName" (dict "root" . "component" "notes-mcp") -}}
 {{- end -}}
 
 {{- define "upstreams.everythingMcp.name" -}}
-{{- include "common.componentName" (dict "root" .root "component" "everything-mcp") -}}
+{{- include "common.componentName" (dict "root" . "component" "everything-mcp") -}}
 {{- end -}}

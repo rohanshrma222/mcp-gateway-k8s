@@ -1,0 +1,93 @@
+{{- $ctx := dict "root" $ "component" "mariadb" "spec" .Values.mariadb }}
+{{- if not .Values.mariadb.persistence.enabled }}
+{{/*
+No emptyDir fallback on purpose. The brief requires a PersistentVolumeClaim for the
+database, and a chart that quietly degrades to ephemeral storage would pass `helm install`
+and fail the requirement silently - the worst combination. Same philosophy as the probe
+and resource guardrails in charts/common: refuse, and say why.
+*/}}
+{{- fail "mariadb.persistence.enabled must be true: the database requires a PersistentVolumeClaim (see charts/store/templates/mariadb-statefulset.yaml)" }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "store.mariadb.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  # A StatefulSet rather than a Deployment, for the volume semantics rather than for
+  # ordering: volumeClaimTemplates binds one PVC to one pod identity for the life of that
+  # identity, and does not delete it when the pod or the release goes away. A Deployment
+  # with a hand-written PVC would work for one replica and silently share one volume
+  # between two if anyone ever scaled it.
+  replicas: 1
+  serviceName: {{ include "store.mariadb.name" . }}
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+      {{- /*
+        No checksum/secret annotation here, which is the opposite of the usual advice.
+        The point of that annotation is to restart pods when a Secret changes - but this
+        Secret is stable by construction (common.secretValue reuses the existing value),
+        so the only thing a checksum could do is trigger a database restart during a
+        `helm template`/dry-run render where `lookup` returns nothing and the generated
+        value differs. An unnecessary database restart is worse than a missed one.
+      */}}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: mariadb
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            - name: MARIADB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.mariadb.secretName" . }}
+                  key: mariadb-root-password
+            - name: MARIADB_DATABASE
+              value: {{ .Values.mariadb.auth.database | quote }}
+            - name: MARIADB_USER
+              value: {{ .Values.mariadb.auth.username | quote }}
+            - name: MARIADB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "store.mariadb.secretName" . }}
+                  key: mariadb-password
+            # Runs mariadb-upgrade on start when the data directory was written by an
+            # older server. Without it, bumping the image tag starts a server that
+            # refuses to touch its own tables, which presents as a healthy container and
+            # a broken site. Matters for the upgrade/rollback demo in stage 9.
+            - name: MARIADB_AUTO_UPGRADE
+              value: '1'
+            # Creates a mysql@localhost user with USAGE and nothing else, which is what
+            # healthcheck.sh connects as over the unix socket. This is the line that lets
+            # the probes carry no credential at all - see the probe comments in
+            # values.yaml. Without it, healthcheck.sh --connect fails and the pod never
+            # becomes ready.
+            - name: MARIADB_MYSQL_LOCALHOST_USER
+              value: '1'
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+  # Not templated behind a conditional: see the fail() above. The database always has a
+  # volume.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "common.componentLabels" $ctx | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- include "common.storageClassName" $ctx | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.mariadb.persistence.size | required "mariadb.persistence.size is required" }}
