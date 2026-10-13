@@ -1,0 +1,124 @@
+{{- if .Values.seed.enabled }}
+{{- $ctx := dict "root" $ "component" "seed" "spec" .Values.seed }}
+{{/*
+Step 4.3 - seeds the first admin and member.
+
+Runs the GATEWAY IMAGE with a different command (`node dist/seed.js`) rather than a purpose
+built seeding container. That is the decision worth defending: the password hash has to be
+produced by exactly the same argon2id implementation and parameters that the login route
+will later verify it against. Two implementations of one format drift, and when they do the
+symptom is "the password is correct and login fails" - which is precisely the class of bug
+that cost a day in stage 2 with the WordPress application password, where a hash written by
+one function was verified by another.
+
+A post-install AND post-upgrade hook. Install-only would mean a later change to the seeded
+accounts needs a manual kick; running on every upgrade is safe because the insert is
+ON CONFLICT DO NOTHING, so an existing account is left exactly as it is - including a
+password the admin has since changed.
+
+hook-weight 10, which puts this AFTER the migration Job at weight 0. Helm applies hooks in
+ascending weight order, so the tables exist before anything tries to insert a user. Getting
+this wrong would present as a seed failure naming a missing relation, which is a confusing
+way to learn about hook ordering.
+
+hook-delete-policy: before-hook-creation, not hook-succeeded: a Job spec is immutable so
+the old object must go before a new one is created, and deleting on success would discard
+the logs of the run that created the accounts.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "platform.seed.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: '10'
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.seed.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        # Only this component's own labels. An earlier version ALSO included the gateway's
+        # selector labels here, to get through the Postgres NetworkPolicy, and that was a
+        # bug worth recording because it looked harmless.
+        #
+        # Both includes emit `app.kubernetes.io/component`, so they are the same YAML key:
+        # the second silently overwrote the first and the pod ended up labelled
+        # `component: gateway` with no `component: seed` at all. It had therefore joined
+        # the gateway's Service selector. Endpoints happened to stay clean only because a
+        # Completed pod is not Ready - but this Job declares no readiness probe, so while
+        # it RUNS its container is Ready immediately, and it would be a Service endpoint
+        # for the second or so it takes. A request balanced there gets connection refused,
+        # during a `helm upgrade`, which is exactly when traffic is flowing.
+        #
+        # The fix belongs in the policy, not here: `postgres-networkpolicy.yaml` names the
+        # seed component as a third permitted source. Labels identify a workload; they are
+        # not a place to encode what it is allowed to reach.
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: seed
+          {{- include "common.jobContainerDefaults" $ctx | nindent 10 }}
+          command: ['node', 'dist/seed.js']
+          env:
+            - name: LOG_LEVEL
+              value: {{ .Values.gateway.logLevel | quote }}
+            - name: PGHOST
+              value: {{ include "platform.postgres.name" . | quote }}
+            - name: PGPORT
+              value: {{ (first .Values.postgres.ports).containerPort | quote }}
+            - name: PGDATABASE
+              value: {{ .Values.postgres.auth.database | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgres.auth.username | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.postgres.secretName" . }}
+                  key: postgres-password
+            # The seed script calls loadConfig(), which validates the gateway's whole
+            # schema - so these are required even though seeding does not use them. That
+            # is a small cost for one consequence worth having: the seed Job fails on a
+            # misconfiguration at install time, before the gateway rolls out with it.
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.gateway.jwtSecretName" . }}
+                  key: jwt-secret
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.gateway.encryptionSecretName" . }}
+                  key: encryption-key
+            - name: SEED_ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.bootstrapSecretName" . }}
+                  key: admin-email
+            - name: SEED_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.bootstrapSecretName" . }}
+                  key: admin-password
+            - name: SEED_MEMBER_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.bootstrapSecretName" . }}
+                  key: member-email
+            - name: SEED_MEMBER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.bootstrapSecretName" . }}
+                  key: member-password
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

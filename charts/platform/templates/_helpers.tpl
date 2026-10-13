@@ -46,3 +46,15 @@ the other, and `values-prod.yaml` can point each at a different externally manag
 {{- printf "%s-encryption" (include "common.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "platform.bootstrapSecretName" -}}
+{{- if .Values.secrets.bootstrapExistingSecret -}}
+{{- .Values.secrets.bootstrapExistingSecret -}}
+{{- else -}}
+{{- printf "%s-bootstrap" (include "common.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "platform.seed.name" -}}
+{{- include "common.componentName" (dict "root" . "component" "seed") -}}
+{{- end -}}

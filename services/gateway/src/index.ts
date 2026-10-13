@@ -11,13 +11,14 @@ import { loadConfig } from './config.js';
 import { createPool } from './db.js';
 import { createLogger } from './logger.js';
 import { createMetrics } from './metrics.js';
+import { initDummyHash } from './auth/passwords.js';
 
 // Exits non-zero with the offending field names if anything is missing or malformed.
 const config = loadConfig();
 const logger = createLogger(config.LOG_LEVEL);
 const db = createPool(config, logger);
 const metrics = createMetrics(config.METRICS_ENABLED);
-const app = buildApp({ config, logger, db, metrics });
+
 
 /**
  * Note what is NOT done here: no connection to Postgres is attempted before listening.
@@ -30,6 +31,15 @@ const app = buildApp({ config, logger, db, metrics });
  * says exactly what is wrong.
  */
 async function main(): Promise<void> {
+  // Computed once, before listening. This is the hash the login route verifies against
+  // when no user matches, so that a missing account costs the same time as a wrong
+  // password - see auth/passwords.ts. Doing it per request would add a second, different
+  // timing signal, which is the problem it exists to remove.
+  await initDummyHash();
+
+  const app = await buildApp({ config, logger, db, metrics });
+  appRef = app;
+
   // 0.0.0.0, not localhost. A server bound to the loopback interface inside a container
   // is unreachable from the kubelet and from every other pod, which presents as a
   // readiness probe failing with "connection refused" on a process that is running
@@ -60,6 +70,13 @@ async function main(): Promise<void> {
  * difference between a clean failure the caller can retry and a half-written audit row.
  */
 let shuttingDown = false;
+/**
+ * Held at module scope because the signal handlers are registered before the app exists -
+ * buildApp is async now that it registers plugins. A handler firing before startup
+ * finishes therefore has nothing to close, which is handled explicitly below rather than
+ * crashing in the handler.
+ */
+let appRef: Awaited<ReturnType<typeof buildApp>> | undefined;
 
 async function shutdown(signal: string): Promise<void> {
   // A second SIGTERM during a drain must not start a second drain - that races the first
@@ -69,7 +86,7 @@ async function shutdown(signal: string): Promise<void> {
 
   logger.info({ signal }, 'shutting down');
   try {
-    await app.close();
+    if (appRef !== undefined) await appRef.close();
     await db.end();
     logger.info('shutdown complete');
     process.exit(0);

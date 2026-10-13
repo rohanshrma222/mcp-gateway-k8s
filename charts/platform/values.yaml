@@ -116,6 +116,11 @@ gateway:
     enabled: true
     minAvailable: 1
   logLevel: info
+  # Whether the session cookie carries the Secure attribute. True here so the safe value
+  # is the default; values-local.yaml turns it off because the kind cluster serves plain
+  # HTTP, where a Secure cookie is never stored at all - login would appear to succeed and
+  # every later request would 401.
+  cookieSecure: true
   # Pool size PER REPLICA, and the arithmetic matters: this is multiplied by the replica
   # count, and exceeding Postgres's max_connections (default 100) turns a traffic spike
   # into "too many clients already" for every replica at once. 10 x 2 leaves ample
@@ -132,6 +137,28 @@ gateway:
   # private addresses.
   upstreamAllowlist:
     - '*.svc.cluster.local'
+
+# ------------------------------------------------------------------------ seed
+
+seed:
+  enabled: true
+  # The gateway image, run as `node dist/seed.js`. The same image on purpose: the password
+  # hash must be produced by exactly the argon2id code and parameters that the login route
+  # verifies it against, and two implementations of one format drift.
+  image:
+    repository: urumi/gateway
+    tag: dev
+  adminEmail: admin@urumi.local
+  memberEmail: member@urumi.local
+  backoffLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 96Mi }
+    # 256Mi, not less: argon2id is configured for 19 MiB per hash and the Node runtime
+    # needs room around it. Two hashes run here, sequentially, so this is comfortable.
+    limits: { cpu: 500m, memory: 256Mi }
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
 
 # ------------------------------------------------------------------- dashboard
 

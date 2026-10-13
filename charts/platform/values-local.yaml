@@ -19,6 +19,12 @@ gateway:
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: 500m, memory: 384Mi }
+  # Plain HTTP locally, so a Secure cookie would never be stored by the browser: login
+  # would appear to succeed and every subsequent request would 401. This is exactly the
+  # kind of genuine environment difference the overlays exist for - and it is the one
+  # setting in this file that is a security relaxation rather than a sizing change, which
+  # is why it is spelled out rather than left implicit.
+  cookieSecure: false
 
 ingress:
   tls:

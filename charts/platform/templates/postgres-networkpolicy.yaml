@@ -53,6 +53,16 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "common.selectorLabels" (dict "root" $ "component" "migrations") | nindent 14 }}
+        # The seed Job, which inserts the first admin and member.
+        #
+        # Named here rather than solved by labelling the seed pod as the gateway, which is
+        # what the first version did. Two components sharing a label to share a permission
+        # also makes them share every other selector that label appears in - in that case
+        # the gateway's Service, which the seed pod then joined. A permission belongs in
+        # the policy that grants it.
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "seed") | nindent 14 }}
       ports:
         {{- range .Values.postgres.ports }}
         - protocol: {{ .protocol | default "TCP" }}

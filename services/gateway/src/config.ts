@@ -56,6 +56,20 @@ const schema = z.object({
     .string()
     .regex(/^[0-9a-f]{64}$/, 'ENCRYPTION_KEY must be 64 lowercase hex characters (32 bytes)'),
 
+  /**
+   * Whether the session cookie carries the `Secure` attribute, i.e. HTTPS only.
+   *
+   * Defaults to **true**, so the safe value is what you get by forgetting to set it. The
+   * local overlay turns it off because the kind cluster serves plain HTTP and a Secure
+   * cookie would simply never be stored, making login appear to succeed and every later
+   * request 401. Defaulting the other way would mean a production deployment that quietly
+   * sends session cookies over plaintext if the value were ever omitted.
+   */
+  COOKIE_SECURE: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 
   /**

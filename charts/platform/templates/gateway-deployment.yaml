@@ -107,6 +107,8 @@ spec:
             # refusal to boot rather than a surprise when the SSRF guard first runs.
             - name: UPSTREAM_ALLOWLIST
               value: {{ join "," .Values.gateway.upstreamAllowlist | quote }}
+            - name: COOKIE_SECURE
+              value: {{ .Values.gateway.cookieSecure | quote }}
             - name: METRICS_ENABLED
               value: {{ .Values.metrics.enabled | quote }}
           volumeMounts:

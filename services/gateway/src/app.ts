@@ -10,7 +10,10 @@
  * being overhead and start being the thing that keeps it coherent.
  */
 import { randomUUID } from 'node:crypto';
+import cookie from '@fastify/cookie';
 import Fastify, { LogController, type FastifyError } from 'fastify';
+import { makeRequireAuth } from './auth/middleware.js';
+import { authRoutes } from './routes/auth.js';
 import type { Config } from './config.js';
 import { pingDb, type Db } from './db.js';
 import type { Logger } from './logger.js';
@@ -34,7 +37,7 @@ const READYZ_BUDGET_MS = 2_000;
  * genuinely a different type and annotating it is a lie the compiler correctly rejects.
  * Inferring keeps the real type, and `App` below gives callers a name for it.
  */
-export function buildApp({ config, logger, db, metrics }: AppDeps) {
+export async function buildApp({ config, logger, db, metrics }: AppDeps) {
   const app = Fastify({
     // Fastify logs through pino natively, so handing it the configured instance means
     // application logs and request logs share one stream, one redaction list and one
@@ -70,6 +73,32 @@ export function buildApp({ config, logger, db, metrics }: AppDeps) {
     // server without any request ever completing.
     requestTimeout: 30_000,
   });
+
+  // Cookie parsing, registered before any route that reads request.cookies.
+  //
+  // No `secret` option, so cookies are not signed. That is deliberate rather than an
+  // omission: the session cookie contains a JWT which is already signed and verified with
+  // JWT_SECRET, so a second signature layer would add a second key to manage and protect
+  // nothing that is not already protected. Signed cookies earn their place when the value
+  // is opaque data the server must trust; here the value defends itself.
+  await app.register(cookie);
+
+  // Resolves the session cookie to a principal, re-reading the user row every request so
+  // a disabled or demoted account takes effect immediately. See auth/middleware.ts.
+  const requireAuth = makeRequireAuth({
+    db,
+    jwtSecret: config.JWT_SECRET,
+    cookieSecure: config.COOKIE_SECURE,
+  });
+
+  await app.register(
+    authRoutes({
+      db,
+      jwtSecret: config.JWT_SECRET,
+      cookieSecure: config.COOKIE_SECURE,
+      requireAuth: requireAuth as never,
+    }),
+  );
 
   // Echo the request id back on every response, including errors. Without this, a user
   // reporting "it failed" has nothing to correlate against the logs, and the id is only
@@ -180,4 +209,4 @@ export function buildApp({ config, logger, db, metrics }: AppDeps) {
 }
 
 /** The concrete application type, for callers that need to name it. */
-export type App = ReturnType<typeof buildApp>;
+export type App = Awaited<ReturnType<typeof buildApp>>;
