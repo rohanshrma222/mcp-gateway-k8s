@@ -212,22 +212,49 @@ wooMcp:
     requests: { cpu: 50m, memory: 96Mi }
     limits: { cpu: 500m, memory: 256Mi }
   probes:
+    # timeoutSeconds is set EXPLICITLY on both, and the reason is a bug this caused.
+    #
+    # The kubelet's default is 1 second, which is nowhere in the manifest and therefore
+    # invisible. /readyz reports store reachability as a diagnostic, and the first version
+    # of that probe was unbounded - so during a brief store outage the handler took far
+    # longer than a second, readiness failed on `context deadline exceeded`, and the pod
+    # left its Service exactly when the readiness design exists to keep it in.
+    #
+    # 3 seconds here, against a 1500ms in-process ceiling and a 1000ms store-probe
+    # budget. Both margins are deliberate: a health endpoint that touches the network at
+    # all needs more than the default, and the handler must answer well before the
+    # kubelet stops waiting.
     readiness:
       httpGet: { path: /readyz, port: http }
       periodSeconds: 10
+      timeoutSeconds: 3
     liveness:
       httpGet: { path: /healthz, port: http }
       periodSeconds: 30
       failureThreshold: 6
+      # /healthz touches nothing, so 2s is pure headroom against a busy event loop
+      # rather than against any dependency.
+      timeoutSeconds: 2
   securityContext:
     # A Node process serving HTTP has no reason to write to its own filesystem, so it
     # keeps every default: non-root, read-only root, all capabilities dropped.
     runAsUser: 1000
     runAsGroup: 1000
+    # Required for the mounted credential to be readable. A projected Secret file is
+    # owned by root, and fsGroup is what sets its GROUP - without this, mode 0440 means
+    # root-only and the process fails with EACCES on its own credential.
+    fsGroup: 1000
   ports:
     - name: http
       containerPort: 3000
+  # Budget for a WooCommerce tool call. Generous, because a WordPress install under load
+  # genuinely is slow and a failed tool call is worse than a slow one.
   timeoutSeconds: 20
+  # Budget for the diagnostic store probe inside /readyz. Two orders of magnitude smaller
+  # than a tool call, because it must answer inside the readiness probe's own timeout -
+  # see the comment on probes above.
+  probeTimeoutMs: 1000
+  logLevel: info
 
 # --------------------------------------------------------------------- ingress
 

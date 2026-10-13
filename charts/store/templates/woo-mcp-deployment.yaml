@@ -1,0 +1,98 @@
+{{- $ctx := dict "root" $ "component" "woo-mcp" "spec" .Values.wooMcp }}
+{{/*
+Step 3.4 - the WooCommerce MCP server.
+
+Lives in charts/store rather than charts/upstreams on purpose: it fronts exactly one
+store, so it belongs to that store's release. Installing a second store therefore brings
+its own MCP server with it, which is what makes the multi-store bonus a second
+`helm install` rather than a code change.
+
+Note what this file does NOT create: an Ingress. There is no external route to woo-mcp
+anywhere in this chart, so "unreachable from outside the cluster" is a property of an
+object that does not exist rather than a rule somebody has to maintain. The NetworkPolicy
+in woo-mcp-networkpolicy.yaml then closes the in-cluster path on top of that.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "store.wooMcp.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ .Values.wooMcp.replicas }}
+  # RollingUpdate is safe here, unlike WordPress: this server holds no volume and no
+  # session state, so two instances can run side by side during a rollout.
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: woo-mcp
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            # The in-cluster Service, never the public URL. This server reaches the store
+            # over the cluster network, which is precisely why it needs no route of its
+            # own.
+            - name: WC_BASE_URL
+              value: {{ printf "http://%s" (include "store.wordpress.name" .) | quote }}
+            # ...but the Host header carries the public hostname, because WordPress
+            # answers a Host it does not recognise with a 301 to its configured siteurl.
+            # Without this, every in-cluster call would be redirected to a URL this pod
+            # cannot reach.
+            - name: WC_STORE_HOST
+              value: {{ include "store.host" . | quote }}
+            - name: WC_USERNAME
+              value: {{ .Values.wordpress.auth.adminUser | quote }}
+            # A file path, not the secret value. See the volume below.
+            - name: WC_PASSWORD_FILE
+              value: /etc/woo-mcp/credentials/app-password
+            - name: WC_TIMEOUT_MS
+              value: {{ mul .Values.wooMcp.timeoutSeconds 1000 | quote }}
+            # Much smaller than WC_TIMEOUT_MS on purpose: this one has to fit inside the
+            # readiness probe's timeoutSeconds, not inside a tool call's patience.
+            - name: WC_PROBE_TIMEOUT_MS
+              value: {{ .Values.wooMcp.probeTimeoutMs | quote }}
+            - name: STORE_SLUG
+              value: {{ .Values.store.slug | quote }}
+            - name: PORT
+              value: {{ (first .Values.wooMcp.ports).containerPort | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.wooMcp.logLevel | quote }}
+          volumeMounts:
+            - name: credentials
+              mountPath: /etc/woo-mcp/credentials
+              readOnly: true
+      volumes:
+        # Mounted as a file rather than injected as an environment variable, and the
+        # reason is operational: environment variables are fixed for the life of a
+        # process, so rotating the credential would mean restarting every pod. Kubernetes
+        # updates a mounted Secret in place, and the server re-reads the file when its
+        # mtime changes - so a rotation is picked up by a running process.
+        #
+        # It is also the weaker of the two in terms of exposure: an env var shows up in
+        # `kubectl describe pod`, in crash dumps and in anything that serialises the
+        # process environment.
+        - name: credentials
+          secret:
+            secretName: {{ include "store.wordpress.secretName" . }}
+            # 0440, not 0400. A projected Secret file is owned by root:fsGroup, so
+            # owner-only permissions lock out the very process meant to read it - the
+            # pod comes up and fails every readiness check with EACCES. 0440 is group
+            # readable, which with fsGroup 1000 is exactly this container and nothing
+            # else; 0444 would also work and would be needlessly wider.
+            defaultMode: 0440
+            items:
+              # Only this one key is projected. Mounting the whole Secret would also put
+              # the WordPress admin password and all eight auth salts inside this
+              # container, none of which it has any use for.
+              - key: wordpress-app-password
+                path: app-password

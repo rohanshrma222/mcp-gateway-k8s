@@ -1,0 +1,15 @@
+# Keeps the build context small and prevents local state leaking into an image layer.
+node_modules
+**/node_modules
+**/dist
+.git
+.github
+charts
+kind
+scripts
+docs
+*.md
+*.pdf
+.env
+secrets
+kubeconfig*

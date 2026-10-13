@@ -1,0 +1,21 @@
+{{/*
+ClusterIP, and that is the only address woo-mcp has. No Ingress, no NodePort, no
+LoadBalancer - a name that resolves inside the cluster and nowhere else.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "store.wooMcp.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "woo-mcp") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    {{- range .Values.wooMcp.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "woo-mcp") | nindent 4 }}

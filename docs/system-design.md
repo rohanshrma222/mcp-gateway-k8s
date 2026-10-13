@@ -256,6 +256,27 @@ database), and the gateway's `/healthz` checks only the process while `/readyz` 
 Postgres. **Neither touches the upstream MCP servers**: a dead upstream must degrade one
 server's tools, not remove the gateway from its Service and take the dashboard down too.
 
+### 6.11a A readiness probe may *report* a dependency, but only on its own budget
+
+**Alternative:** have the readiness handler check the dependency with the same client the
+application uses, and simply not let the result affect the status code.
+**Cost:** this looks sufficient and is not, and it cost us a real outage of woo-mcp.
+Ignoring a dependency in the *status code* only closes one of the two ways a probe can
+fail; the other is failing to answer at all. woo-mcp's `/readyz` reports store reachability
+as an informational field, but the first version called the store through the ordinary
+WooCommerce client — which retries with backoff, because a loaded store deserves patience.
+Against an unreachable store it took ~40s to return, and the kubelet's default
+`timeoutSeconds` is **1**. The probe timed out, liveness followed, and the pod left its
+Service during exactly the outage the design existed to survive.
+
+The rule we now apply to every health endpoint: **a diagnostic must be cheaper than the
+deadline of the thing reporting it.** Concretely — a separate single-attempt budget
+(`WC_PROBE_TIMEOUT_MS`, 1000ms, capped in the schema so configuration cannot raise it past
+the probe timeout), an in-handler ceiling independent of that client, and `timeoutSeconds`
+set **explicitly** in values rather than inherited from a 1-second default that appears
+nowhere in the manifest. Verified by scaling WordPress to zero: `/readyz` returns 200 in
+~1.0s naming the reason, the pod stays Ready, and tool calls return a readable error.
+
 ### 6.12 Generated secrets use `lookup` before `randAlphaNum`
 
 **Alternative:** `randAlphaNum` alone, which is the common snippet.
