@@ -1,0 +1,138 @@
+{{- if .Values.migrations.enabled }}
+{{- $ctx := dict "root" $ "component" "migrations" "spec" .Values.migrations }}
+{{/*
+Step 4.1 - the migration runner.
+
+A Helm hook Job rather than an initContainer on the gateway, which is a deviation from my
+own plan and the reason is worth stating.
+
+The plan said "numbered SQL run by an init container". That works, and it has one real
+advantage: the schema is guaranteed present before the application starts. But the gateway
+runs two replicas by default, so an initContainer means two concurrent migration runs on
+every rollout - survivable with the advisory lock, but it also means that every gateway
+replica needs DDL rights on the database for the entire life of the deployment. That is a
+standing grant of CREATE and DROP to the component most exposed to the internet, in
+exchange for ordering convenience.
+
+Separating the runner lets the privileges separate too: the migration Job connects as a
+role that can change the schema, and the gateway will connect as one that can only read
+and write rows. The gateway cannot drop the audit log even if it is compromised. That is
+the stronger posture and it is why this is a Job.
+
+post-install AND post-upgrade, deliberately both. Install-only would mean a later
+migration needs a manual kick, and running on every upgrade is safe precisely because the
+ledger makes it idempotent: already-applied files are skipped, and an edited one is
+refused.
+
+hook-delete-policy: before-hook-creation, not hook-succeeded. A Job's spec is immutable,
+so leaving the previous object behind makes the next upgrade fail with "field is
+immutable"; deleting on success would discard the logs of the run that just migrated the
+database. Deleting the old Job immediately before creating the new one keeps the most
+recent run inspectable with `kubectl logs job/...` while still letting upgrades through.
+
+The pod mounts only a ConfigMap, never the PVC. That is not an accident: a completed pod
+holding a PVC counts as a volume consumer and blocks deletion of that PVC behind the
+kubernetes.io/pvc-protection finalizer, which cost real time in stage 2.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "platform.postgres.name" . }}-migrate
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: '0'
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      initContainers:
+        # Wait for Postgres before the migration container starts.
+        #
+        # A retry loop rather than a single check, because the headless Service has
+        # publishNotReadyAddresses: false - so until Postgres is ready the name does not
+        # resolve at all and this sees NXDOMAIN, not a refused connection. pg_isready
+        # distinguishes "accepting connections" from "port is open", which a TCP probe
+        # cannot: during recovery the port answers and the server will not.
+        - name: wait-for-postgres
+          {{- include "common.jobContainerDefaults" $ctx | nindent 10 }}
+          command:
+            - sh
+            - -c
+            - |
+              set -eu
+              i=0
+              until pg_isready -h "$PGHOST" -U "$PGUSER" -d "$PGDATABASE" >/dev/null 2>&1; do
+                i=$((i + 1))
+                if [ "$i" -ge 90 ]; then
+                  echo "[wait] FATAL: postgres not ready after 90 attempts" >&2
+                  exit 1
+                fi
+                echo "[wait] postgres not ready (attempt $i)"
+                sleep 2
+              done
+              echo "[wait] postgres is ready"
+          env:
+            - name: PGHOST
+              value: {{ include "platform.postgres.name" . | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgres.auth.username | quote }}
+            - name: PGDATABASE
+              value: {{ .Values.postgres.auth.database | quote }}
+      containers:
+        - name: migrate
+          {{- include "common.jobContainerDefaults" $ctx | nindent 10 }}
+          command: ['sh', '/scripts/migrate.sh']
+          env:
+            - name: PGHOST
+              value: {{ include "platform.postgres.name" . | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgres.auth.username | quote }}
+            - name: PGDATABASE
+              value: {{ .Values.postgres.auth.database | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.postgres.secretName" . }}
+                  key: postgres-password
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+            # psql writes a history file and temp files; the root filesystem is read-only.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # One ConfigMap, mounted twice with different key projections: the runner script
+        # at /scripts and the SQL at /migrations. Mounting the whole ConfigMap in one
+        # place would put migrate.sh into the directory the runner globs for *.sql - it
+        # would not match the glob today, but it is the kind of coupling that breaks the
+        # moment someone adds a file.
+        - name: scripts
+          configMap:
+            name: {{ include "platform.postgres.name" . }}-migrations
+            items:
+              - key: migrate.sh
+                path: migrate.sh
+        - name: migrations
+          configMap:
+            name: {{ include "platform.postgres.name" . }}-migrations
+            items:
+              {{- range $path, $_ := .Files.Glob "migrations/*.sql" }}
+              - key: {{ base $path }}
+                path: {{ base $path }}
+              {{- end }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

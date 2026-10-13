@@ -1,0 +1,105 @@
+{{- $ctx := dict "root" $ "component" "postgres" "spec" .Values.postgres }}
+{{- if not .Values.postgres.persistence.enabled }}
+{{/*
+No emptyDir fallback, deliberately. The brief requires a PersistentVolumeClaim for the
+database, and a chart that quietly degraded to ephemeral storage would pass
+`helm install` and fail the requirement silently - the worst combination. Same philosophy
+as the probe and resource guardrails in charts/common: refuse, and say why.
+*/}}
+{{- fail "postgres.persistence.enabled must be true: the control-plane database requires a PersistentVolumeClaim (see charts/platform/templates/postgres-statefulset.yaml)" }}
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "platform.postgres.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  # A StatefulSet for the volume semantics rather than for ordering: volumeClaimTemplates
+  # ties one PVC to one pod identity for the life of that identity and does not delete it
+  # when the pod or the release goes away. A Deployment with a hand-written PVC works for
+  # one replica and silently shares a single volume between two if anyone ever scales it -
+  # which for Postgres means two servers writing one data directory, and that is
+  # unrecoverable rather than merely broken.
+  replicas: 1
+  serviceName: {{ include "platform.postgres.name" . }}
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+      {{- /*
+        No checksum/secret annotation, which is the opposite of the usual advice. That
+        annotation exists to restart pods when a Secret changes, but this Secret is stable
+        by construction (common.secretValue reuses the existing value), so the only thing
+        a checksum could achieve is a database restart during a `helm template` or dry-run
+        render, where `lookup` returns nothing and the generated value differs. An
+        unnecessary database restart is worse than a missed one.
+      */}}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: postgres
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            # POSTGRES_PASSWORD sets the superuser password on first init. It is only read
+            # during initdb; on every later start the password already lives in the data
+            # directory, which is why rotating this value alone does not change anything.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.postgres.secretName" . }}
+                  key: postgres-password
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.auth.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.auth.database | quote }}
+            # PGDATA must be a SUBDIRECTORY of the mount point, not the mount point
+            # itself. A fresh PersistentVolume often arrives with a lost+found directory,
+            # and initdb refuses to initialise a directory that is not empty - so mounting
+            # straight onto /var/lib/postgresql/data gives a pod that crash-loops with
+            # "directory exists but is not empty" on some storage classes and works fine
+            # on others. One subdirectory makes the behaviour the same everywhere.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # Scram rather than md5 for any password Postgres stores itself. md5 is still
+            # the default in some images and is long past defensible.
+            - name: POSTGRES_INITDB_ARGS
+              value: '--auth-host=scram-sha-256 --auth-local=scram-sha-256'
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            # The socket directory and temp space, as emptyDir volumes.
+            #
+            # Postgres writes a unix socket and a lock file at startup, so those paths
+            # must be writable even though the root filesystem is not. Two small emptyDirs
+            # are a far smaller concession than readOnlyRootFilesystem: false, because they
+            # name exactly which paths are writable instead of opening all of them.
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+  # Not behind a conditional: see the fail() above. The database always has a volume.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "common.componentLabels" $ctx | nindent 10 }}
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- include "common.storageClassName" $ctx | nindent 8 }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.persistence.size | required "postgres.persistence.size is required" }}

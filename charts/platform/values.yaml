@@ -46,13 +46,39 @@ postgres:
       periodSeconds: 5
       failureThreshold: 60
   securityContext:
-    readOnlyRootFilesystem: false
+    # readOnlyRootFilesystem stays at the hardened default of true. Postgres does need to
+    # write outside its data directory - a unix socket and a lock file - but the template
+    # gives it emptyDir volumes for exactly those two paths, which names what is writable
+    # instead of opening the whole filesystem. uid/gid 70 is `postgres` in the Alpine
+    # image; fsGroup is what lets a non-root process write to the mounted PVC.
     runAsUser: 70
     runAsGroup: 70
     fsGroup: 70
   ports:
     - name: postgres
       containerPort: 5432
+
+# ------------------------------------------------------------------ migrations
+
+migrations:
+  enabled: true
+  # The same image as the server, so psql is guaranteed to be the matching major version.
+  # A separate client image would be smaller and would introduce a version skew nobody
+  # thinks about until a newer server speaks a protocol the older client does not.
+  image:
+    repository: postgres
+    tag: '18.2-alpine'
+  # Three attempts. A migration that fails for a transient reason (the database finished
+  # starting a second later) deserves a retry; one that fails because the SQL is wrong
+  # will fail identically three times and then stop, which is the right outcome - an
+  # unbounded backoffLimit would retry a syntax error until the hook times out.
+  backoffLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 192Mi }
+  securityContext:
+    runAsUser: 70
+    runAsGroup: 70
 
 # --------------------------------------------------------------------- gateway
 

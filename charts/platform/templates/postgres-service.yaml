@@ -1,0 +1,31 @@
+{{/*
+Headless Service for the Postgres StatefulSet.
+
+`clusterIP: None` is what gives the pod a stable DNS name
+(<name>-0.<service>.<ns>.svc.cluster.local) that survives rescheduling onto a node with a
+different pod IP. With one replica a virtual IP would add an indirection and buy nothing;
+if a read replica is ever added, that is when a separate read Service earns its place.
+
+publishNotReadyAddresses stays false, so this name does not resolve until Postgres passes
+its readiness probe. A client therefore cannot connect to a server still replaying WAL.
+The consequence is that a waiting initContainer sees NXDOMAIN rather than a refused
+connection, which is why the wait below is a retry loop rather than a single check.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "platform.postgres.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "postgres") | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    {{- range .Values.postgres.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "postgres") | nindent 4 }}

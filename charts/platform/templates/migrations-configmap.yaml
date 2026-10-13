@@ -1,0 +1,136 @@
+{{- if .Values.migrations.enabled }}
+{{/*
+The migration runner and the migrations themselves.
+
+The SQL is read from charts/platform/migrations/*.sql with .Files.Glob rather than being
+inlined here. That keeps each migration a real .sql file: syntax-highlighted, reviewable
+in a diff, and readable by psql directly when debugging, instead of a YAML string that
+nobody checks.
+
+hook-weight -5 so the ConfigMap exists before the Job that mounts it. Helm applies hooks
+in ascending weight order, and a Job mounting a missing ConfigMap sits Pending until the
+hook times out - a failure that reports as a timeout and says nothing about the cause.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "platform.postgres.name" . }}-migrations
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "migrations") | nindent 4 }}
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: '-5'
+    helm.sh/hook-delete-policy: before-hook-creation
+data:
+  migrate.sh: |
+    #!/bin/sh
+    # Applies numbered SQL migrations exactly once each, in order.
+    #
+    # Numbered files and a ledger table, not an ORM's migration framework. The brief's
+    # walkthrough means defending every moving part under questioning, and "plain SQL
+    # applied in filename order, recorded in a table you can SELECT from" is a complete
+    # explanation. A framework would add inferred diffs and a state machine to explain,
+    # in exchange for conveniences this project does not need.
+    set -eu
+
+    : "${PGHOST:?}" "${PGUSER:?}" "${PGDATABASE:?}" "${PGPASSWORD:?}"
+    DIR=/migrations
+
+    log() { echo "[migrate] $*"; }
+
+    # psql flags, each load-bearing:
+    #   -v ON_ERROR_STOP=1  without it psql reports failures and exits 0, so a broken
+    #                       migration would be recorded as applied
+    #   --no-psqlrc         ignore any ~/.psqlrc that could change output formatting
+    #   -qtAX               quiet, tuples only, unaligned - a scalar query returns a bare
+    #                       value rather than an ASCII table
+    PSQL="psql -v ON_ERROR_STOP=1 --no-psqlrc -qtAX"
+
+    # Postgres accepts connections before this runs - the initContainer waits on it - but
+    # the gap between "accepting connections" and "accepting connections to this database"
+    # is real on a first install, so this retries rather than assuming.
+    i=0
+    until $PSQL -c 'SELECT 1' >/dev/null 2>&1; do
+      i=$((i + 1))
+      if [ "$i" -ge 60 ]; then
+        log "FATAL: database did not accept a query after 60 attempts"
+        exit 1
+      fi
+      log "waiting for database (attempt $i)"
+      sleep 2
+    done
+    log "database reachable"
+
+    # The ledger, created here rather than in 001 for the obvious reason: 001 cannot
+    # record that it ran in a table it is itself responsible for creating.
+    $PSQL <<'LEDGER'
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+        filename    text        PRIMARY KEY,
+        -- sha256 of the file as applied, so a later run can notice that an
+        -- already-applied migration has since been edited. Without it, two databases can
+        -- share a ledger and hold different schemas with no way to tell.
+        checksum    text        NOT NULL,
+        applied_at  timestamptz NOT NULL DEFAULT now()
+    );
+    LEDGER
+
+    # Everything below happens in ONE psql session, and that is structural rather than
+    # stylistic.
+    #
+    # pg_advisory_lock is session-scoped, so the lock is only held while the session that
+    # took it is open - the work has to happen inside that same session. Deciding which
+    # migrations are pending must also happen inside it, otherwise two runners could both
+    # read "001 is not applied", then serialise on the lock, and the second would fail on
+    # a CREATE TABLE that already exists.
+    #
+    # Today one Job holds the lock and it looks redundant. It is not: the moment a second
+    # gateway replica, a developer running this by hand, or two overlapping `helm upgrade`
+    # invocations can reach the database, the race is live. One query removes the class.
+    #
+    # The pending check is psql's \gset + \if rather than shell, because a shell `exit`
+    # inside a pipeline exits only the subshell - the generating block would stop emitting
+    # while psql happily executed whatever had already been written. Keeping the decision
+    # in SQL means ON_ERROR_STOP governs the whole run.
+    LOCK_KEY=824413
+
+    {
+      echo "\\set ON_ERROR_STOP on"
+      echo "SELECT pg_advisory_lock(${LOCK_KEY});"
+
+      for file in "$DIR"/*.sql; do
+        name=$(basename "$file")
+        sum=$(sha256sum "$file" | cut -d' ' -f1)
+
+        # Refuse rather than warn on a changed migration: the schema in front of us is
+        # not the schema this file describes, and guessing which to trust is how a server
+        # and a laptop quietly diverge. Emitted as one line - PL/pgSQL does not care, and
+        # a heredoc inside a YAML block scalar depends on indentation surviving two layers
+        # of stripping, which is not a thing to rely on. Dollar-quoted with $mig$ so it
+        # cannot collide with $$ inside a migration body.
+        echo "DO \$mig\$ BEGIN IF EXISTS (SELECT 1 FROM schema_migrations WHERE filename = '${name}' AND checksum <> '${sum}') THEN RAISE EXCEPTION 'migration ${name} was already applied with a different checksum; on disk it is now ${sum}. An applied migration must never be edited - add a new numbered file instead.'; END IF; END \$mig\$;"
+
+        echo "SELECT NOT EXISTS (SELECT 1 FROM schema_migrations WHERE filename = '${name}') AS mig_pending \\gset"
+        echo "\\if :mig_pending"
+        echo "\\echo 'apply ${name}'"
+        # BEGIN/COMMIT per file, so a migration failing halfway leaves nothing behind.
+        # Postgres has transactional DDL, which is exactly why this is worth doing: the
+        # ledger row commits together with the schema change, so the two cannot disagree.
+        echo "BEGIN;"
+        cat "$file"
+        echo "INSERT INTO schema_migrations (filename, checksum) VALUES ('${name}', '${sum}');"
+        echo "COMMIT;"
+        echo "\\else"
+        echo "\\echo 'skip ${name} (already applied)'"
+        echo "\\endif"
+      done
+
+      echo "SELECT pg_advisory_unlock(${LOCK_KEY});"
+    } | $PSQL
+
+    log "done. applied migrations:"
+    $PSQL -c 'SELECT filename, applied_at FROM schema_migrations ORDER BY filename'
+{{- range $path, $_ := .Files.Glob "migrations/*.sql" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+{{- end }}
