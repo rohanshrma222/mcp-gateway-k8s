@@ -1,0 +1,110 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ctx := dict "root" $ "component" "woo-mcp" }}
+{{/*
+Step 3.5 - the isolation that makes the mandatory requirement real.
+
+Everything here rests on enforcement actually happening. Kubernetes accepts a
+NetworkPolicy object on any cluster - the API server validates and stores it - and
+delegates enforcement entirely to the CNI. kind's default CNI does not implement it, so on
+a default cluster all three of these policies would be listed by `kubectl get netpol` and
+quietly ignored. That is why `scripts/verify-netpol.ps1` proved enforcement, and proved it
+is *selective*, before any of this was written.
+
+Three objects, because "only the gateway can reach woo-mcp" needs all three:
+
+  1. default-deny      nothing in this namespace accepts traffic unless a policy allows it
+  2. allow-gateway     woo-mcp accepts traffic ONLY from pods labelled as the gateway
+  3. egress rules      woo-mcp can reach the store and DNS, and nothing else
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "common.fullname" . }}-default-deny
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "netpol") | nindent 4 }}
+spec:
+  # Empty podSelector means every pod in this namespace. Ingress only: denying egress
+  # here as well would break DNS for every workload at once, and the egress rules below
+  # are written per component where the allowed destinations are actually known.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.wooMcp.name" . }}-allow-gateway
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # Selected by LABEL, not by IP range. Pod addresses change on every reschedule,
+        # so an address-based rule is either wrong after the first restart or so wide it
+        # permits the whole subnet. A label follows the workload.
+        #
+        # namespaceSelector and podSelector inside ONE `from` entry are an AND: the
+        # traffic must come from a pod carrying the gateway labels AND in the platform
+        # namespace. Written as two separate list entries they would be an OR - "any pod
+        # with these labels anywhere, or any pod at all in that namespace" - which is a
+        # genuinely common mistake and silently much weaker than it looks.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.gatewayNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayPodLabels | nindent 14 }}
+      ports:
+        {{- range .Values.wooMcp.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .name }}
+        {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.wooMcp.name" . }}-egress
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS first, and this is the rule everyone forgets. The moment a pod is selected by
+    # any Egress policy it is isolated for egress, so DNS stops resolving unless it is
+    # explicitly allowed - and the resulting failure looks like the application is broken
+    # rather than like a policy problem.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The store, and only the store. Note what this forbids: woo-mcp cannot reach the
+    # internet, the Kubernetes API, the platform namespace, or the other upstream MCP
+    # servers. If this server were ever compromised through a dependency, the blast radius
+    # is one WordPress install it already had a credential for.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "wordpress") | nindent 14 }}
+      ports:
+        {{- range .Values.wordpress.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .containerPort }}
+        {{- end }}
+{{- end }}

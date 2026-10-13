@@ -282,3 +282,8 @@ networkPolicy:
     app.kubernetes.io/name: platform
     app.kubernetes.io/component: gateway
   gatewayNamespace: urumi-platform
+  # The ingress controller, so the storefront is reachable through Traefik while the
+  # namespace-wide default-deny is in force.
+  ingressNamespace: traefik
+  ingressPodLabels:
+    app.kubernetes.io/name: traefik

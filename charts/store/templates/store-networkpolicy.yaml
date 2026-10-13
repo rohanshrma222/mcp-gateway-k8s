@@ -1,0 +1,94 @@
+{{- if .Values.networkPolicy.enabled }}
+{{/*
+The allow rules the default-deny makes necessary.
+
+This file exists because of a mistake worth recording. The first version of step 3.5 added
+a namespace-wide default-deny plus one allow rule for woo-mcp, and that read as "woo-mcp is
+now isolated". It is not what it does. `podSelector: {}` selects EVERY pod in the
+namespace, so the deny applied to MariaDB and WordPress too - and with no allow rule for
+them, WordPress could no longer reach its own database. It hung on connection, failed
+readiness, then failed liveness and restarted.
+
+So: a default-deny is a namespace-wide commitment, not a per-workload one. Every legitimate
+path has to be enumerated, and the list below IS the complete set of connections this
+namespace needs:
+
+  traefik  -> wordpress   the storefront
+  wordpress -> mariadb    the application to its database
+  bootstrap -> mariadb    the Helm hook running wp-cli
+  woo-mcp  -> wordpress   the MCP server to the REST API (egress side in the other file)
+  gateway  -> woo-mcp     the only ingress woo-mcp accepts (in the other file)
+
+Anything not in that list is denied, which is the point - including woo-mcp reaching the
+internet, and anything at all reaching MariaDB from outside this namespace.
+
+An observation rather than a claim: kubelet health probes continue to work with these
+policies in place. Probe traffic originates from the node rather than from a pod, and in
+this setup it is not subject to pod policy - demonstrated by woo-mcp's readiness probe
+returning an HTTP 503 from the application while the deny was active, which it could not
+have done had the packet been dropped. Worth verifying on any cluster before relying on
+it, because a default-deny that silently blocked probes would restart every workload in
+the namespace.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.mariadb.name" . }}-allow
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "mariadb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "mariadb") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # WordPress, and the bootstrap hook that runs wp-cli against the same database.
+        # Two separate list entries here is correct and deliberate: these are alternative
+        # sources, so OR is what is wanted. Inside a single `from` entry they would be
+        # ANDed and match nothing, since no pod is both.
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "wordpress") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "bootstrap") | nindent 14 }}
+      ports:
+        {{- range .Values.mariadb.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .name }}
+        {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.wordpress.name" . }}-allow
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "wordpress") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "wordpress") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # The ingress controller, by namespace and pod label rather than by address.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressPodLabels | nindent 14 }}
+        # woo-mcp, which calls the WooCommerce REST API over this same port. Same
+        # namespace, so a podSelector alone is enough.
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "woo-mcp") | nindent 14 }}
+      ports:
+        {{- range .Values.wordpress.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .name }}
+        {{- end }}
+{{- end }}
