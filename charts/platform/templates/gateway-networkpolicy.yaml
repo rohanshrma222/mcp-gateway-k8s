@@ -1,0 +1,92 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ctx := dict "root" $ "component" "gateway" }}
+{{/*
+The gateway's own isolation, and it is the pod where this matters most: it holds every
+upstream credential, every user's hashed API key, the JWT signing key and the encryption
+key. Both directions are constrained.
+
+Scoped to this workload rather than applied namespace-wide. The namespace-wide default-deny
+for `urumi-platform` arrives with the stage 9 sweep, once every legitimate path in the
+namespace is known and can be enumerated in one place - which is the lesson from stage 3,
+where a `podSelector: {}` deny was written before its allow rules existed and cut WordPress
+off from its own database. A policy selecting one pod already makes that pod default-deny
+for the directions it names, so this isolates the gateway completely without being able to
+break anything else.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "platform.gateway.name" . }}-allow
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # The ingress controller, by namespace AND pod label in ONE `from` entry, so both
+        # must hold: a pod carrying the Traefik labels, in the Traefik namespace. Written
+        # as two separate entries these would be ORed - "any pod with these labels
+        # anywhere, or any pod at all in that namespace" - which looks nearly identical
+        # and is far weaker.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressPodLabels | nindent 14 }}
+      ports:
+        {{- range .Values.gateway.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .name }}
+        {{- end }}
+  egress:
+    # DNS first, and this is the rule everyone forgets. The moment a pod is selected by
+    # any Egress policy it is isolated for egress, so DNS stops resolving unless it is
+    # explicitly allowed - and the resulting failure looks like the application is broken
+    # rather than like a policy problem.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Its own database, in this namespace.
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "postgres") | nindent 14 }}
+      ports:
+        {{- range .Values.postgres.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .containerPort }}
+        {{- end }}
+    # The upstream MCP servers, by namespace.
+    #
+    # Namespace granularity rather than pod granularity, deliberately: the registry is
+    # dynamic, so an admin can add an upstream at runtime and the chart cannot know its
+    # labels. Narrowing to a namespace is the tightest rule that still lets the feature
+    # work, and the namespaces listed hold only MCP servers.
+    #
+    # Note what this still forbids, which is the point: the gateway cannot reach the
+    # public internet, the Kubernetes API, or any other namespace. The SSRF guard in 4.6
+    # inspects a candidate URL before it is ever stored; this is the layer that holds when
+    # the guard is wrong, because a URL that passes validation and resolves somewhere
+    # unexpected still has to get past the dataplane.
+    {{- range .Values.networkPolicy.upstreamNamespaces }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
+{{- end }}

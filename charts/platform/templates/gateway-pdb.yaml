@@ -1,0 +1,25 @@
+{{- if .Values.gateway.podDisruptionBudget.enabled }}
+{{/*
+Keep at least one replica serving during a voluntary disruption - a node drain, a cluster
+upgrade, a `kubectl drain` during maintenance.
+
+Worth being precise about what this does and does not do: a PDB only constrains VOLUNTARY
+evictions. It does not protect against a node failing, a pod being OOM-killed, or someone
+deleting a Deployment. It stops the eviction API from taking the last healthy replica,
+which is exactly the case a rolling node upgrade would otherwise hit.
+
+minAvailable: 1 rather than a percentage, because with two replicas `50%` rounds in a way
+that is easy to get wrong and says less about the intent.
+*/}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "platform.gateway.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "gateway") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.gateway.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "gateway") | nindent 6 }}
+{{- end }}

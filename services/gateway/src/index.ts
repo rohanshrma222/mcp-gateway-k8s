@@ -1,0 +1,97 @@
+/**
+ * Entry point: validate configuration, build the dependencies, listen, and shut down
+ * cleanly.
+ *
+ * The order is deliberate. Configuration is validated before anything is constructed, so
+ * a missing secret is a one-line startup failure rather than an exception thrown from a
+ * request handler once the process is already serving traffic.
+ */
+import { buildApp } from './app.js';
+import { loadConfig } from './config.js';
+import { createPool } from './db.js';
+import { createLogger } from './logger.js';
+import { createMetrics } from './metrics.js';
+
+// Exits non-zero with the offending field names if anything is missing or malformed.
+const config = loadConfig();
+const logger = createLogger(config.LOG_LEVEL);
+const db = createPool(config, logger);
+const metrics = createMetrics(config.METRICS_ENABLED);
+const app = buildApp({ config, logger, db, metrics });
+
+/**
+ * Note what is NOT done here: no connection to Postgres is attempted before listening.
+ *
+ * That is on purpose. Blocking startup on the database means a gateway that cannot start
+ * while Postgres is briefly unavailable, so it never reaches the point of serving
+ * /readyz - and Kubernetes reports CrashLoopBackOff, which looks like the gateway is
+ * broken rather than like its dependency is. Starting, then reporting unready with a
+ * reason, is both more honest and more useful: the pod stays inspectable and `/readyz`
+ * says exactly what is wrong.
+ */
+async function main(): Promise<void> {
+  // 0.0.0.0, not localhost. A server bound to the loopback interface inside a container
+  // is unreachable from the kubelet and from every other pod, which presents as a
+  // readiness probe failing with "connection refused" on a process that is running
+  // perfectly.
+  await app.listen({ host: '0.0.0.0', port: config.PORT });
+
+  logger.info(
+    {
+      port: config.PORT,
+      database: `${config.PGHOST}:${config.PGPORT}/${config.PGDATABASE}`,
+      poolMax: config.PG_POOL_MAX,
+      metrics: config.METRICS_ENABLED,
+      upstreamAllowlist: config.UPSTREAM_ALLOWLIST,
+    },
+    'gateway listening',
+  );
+}
+
+/**
+ * Graceful shutdown.
+ *
+ * Kubernetes sends SIGTERM and waits `terminationGracePeriodSeconds` before SIGKILL. Two
+ * things have to happen in that window, in this order: stop accepting new work and let
+ * in-flight requests finish (`app.close()`), then release the database pool. Draining
+ * the pool first would fail the very requests the drain is meant to protect.
+ *
+ * This matters more once there are writes. A `tools/call` cut off mid-flight is the
+ * difference between a clean failure the caller can retry and a half-written audit row.
+ */
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  // A second SIGTERM during a drain must not start a second drain - that races the first
+  // and can close the pool while requests are still using it.
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  logger.info({ signal }, 'shutting down');
+  try {
+    await app.close();
+    await db.end();
+    logger.info('shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    logger.error({ err: error }, 'error during shutdown');
+    process.exit(1);
+  }
+}
+
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(signal, () => void shutdown(signal));
+}
+
+// An unhandled rejection leaves the process in a state nobody reasoned about. Logging and
+// exiting lets Kubernetes restart a clean one; the alternative is a replica that stays in
+// its Service while holding corrupt state, which is strictly worse than being gone.
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ err: reason }, 'unhandled rejection, exiting');
+  process.exit(1);
+});
+
+main().catch((error: unknown) => {
+  logger.fatal({ err: error }, 'failed to start');
+  process.exit(1);
+});

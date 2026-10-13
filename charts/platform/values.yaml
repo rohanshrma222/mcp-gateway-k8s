@@ -115,6 +115,12 @@ gateway:
   podDisruptionBudget:
     enabled: true
     minAvailable: 1
+  logLevel: info
+  # Pool size PER REPLICA, and the arithmetic matters: this is multiplied by the replica
+  # count, and exceeding Postgres's max_connections (default 100) turns a traffic spike
+  # into "too many clients already" for every replica at once. 10 x 2 leaves ample
+  # headroom for the migration Job and an administrator's psql session.
+  poolMax: 10
   upstreamProbeIntervalSeconds: 15
   upstreamTimeoutSeconds: 20
   rateLimit:
@@ -200,6 +206,21 @@ secrets:
 
 networkPolicy:
   enabled: true
+  # The ingress controller, selected by namespace AND pod label, so the gateway's HTTP
+  # port is reachable from Traefik and from nothing else.
+  ingressNamespace: traefik
+  ingressPodLabels:
+    app.kubernetes.io/name: traefik
+  # Namespaces holding upstream MCP servers the gateway is allowed to dial. Listed
+  # explicitly rather than allowing all egress: the gateway holds every upstream
+  # credential and every user's API key, so it is the pod whose outbound reach matters
+  # most. `mcp-upstreams` is listed before it exists, because an egress rule naming a
+  # namespace that has not been created yet is simply inert - whereas discovering the
+  # omission in stage 6 would present as an upstream that is unreachable for no visible
+  # reason.
+  upstreamNamespaces:
+    - store-default
+    - mcp-upstreams
 
 metrics:
   # prom-client /metrics on the gateway. No Ingress path: metrics are scraped in-cluster,

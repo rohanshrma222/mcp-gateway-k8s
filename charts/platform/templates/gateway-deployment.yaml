@@ -1,0 +1,120 @@
+{{- $ctx := dict "root" $ "component" "gateway" "spec" .Values.gateway }}
+{{/*
+Step 4.2 - the gateway, as a skeleton: config, logging, and the three operational
+endpoints. Identity, the registry and the MCP endpoint land in 4.3 through 5.4.
+
+A Deployment, not a StatefulSet, and that is the whole architectural claim of this
+project in one line: the gateway holds no state of its own. Everything durable is in
+Postgres, so a replica is interchangeable, any replica can answer any request, and
+scaling is a number. If this ever needed to be a StatefulSet, something would have gone
+wrong in the design rather than in the chart.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "platform.gateway.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  # Two by default in every environment, including a laptop. Not a scaling flourish: the
+  # /mcp endpoint is a stateless Streamable HTTP server with no session store, and running
+  # two replicas everywhere means accidental in-memory state fails during development
+  # rather than in production.
+  replicas: {{ .Values.gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Never fewer than the configured count during a rollout, and at most one extra
+      # pod at a time. With two replicas that keeps both serving while the new one proves
+      # itself, which is what makes the upgrade/rollback demo in 9.6 a non-event.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+      annotations:
+        # Unlike the database StatefulSets, this one DOES want a checksum annotation.
+        #
+        # The gateway reads JWT_SECRET and ENCRYPTION_KEY as environment variables, and an
+        # env var is fixed for the life of a process - so a rotated Secret would be
+        # ignored until something happened to restart the pod, which could be weeks. The
+        # checksum makes `helm upgrade` roll the Deployment when either value changes.
+        #
+        # The reason this is safe here and not for Postgres: rolling a stateless replica
+        # costs nothing, while rolling a database during a dry-run render where `lookup`
+        # returns a fresh random value would be an unnecessary database restart.
+        checksum/secrets: {{ printf "%s/%s" (include "platform.gateway.jwtSecretName" .) (include "platform.gateway.encryptionSecretName" .) | sha256sum }}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      # Spread replicas across nodes where possible. ScheduleAnyway rather than
+      # DoNotSchedule: on a single-node cluster a hard constraint would leave the second
+      # replica Pending forever, and the point is availability, not a rule for its own
+      # sake.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" $ctx | nindent 14 }}
+      containers:
+        - name: gateway
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            - name: PORT
+              value: {{ (first .Values.gateway.ports).containerPort | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.gateway.logLevel | quote }}
+
+            # Postgres, assembled from parts. The password arrives from its own Secret,
+            # which is why this is five variables rather than one connection string: a
+            # DSN built in the template would put the credential into the rendered
+            # manifest and then into `kubectl describe pod`.
+            - name: PGHOST
+              value: {{ include "platform.postgres.name" . | quote }}
+            - name: PGPORT
+              value: {{ (first .Values.postgres.ports).containerPort | quote }}
+            - name: PGDATABASE
+              value: {{ .Values.postgres.auth.database | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgres.auth.username | quote }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.postgres.secretName" . }}
+                  key: postgres-password
+            - name: PG_POOL_MAX
+              value: {{ .Values.gateway.poolMax | quote }}
+
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.gateway.jwtSecretName" . }}
+                  key: jwt-secret
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.gateway.encryptionSecretName" . }}
+                  key: encryption-key
+
+            # Comma separated, parsed and validated at startup so a malformed list is a
+            # refusal to boot rather than a surprise when the SSRF guard first runs.
+            - name: UPSTREAM_ALLOWLIST
+              value: {{ join "," .Values.gateway.upstreamAllowlist | quote }}
+            - name: METRICS_ENABLED
+              value: {{ .Values.metrics.enabled | quote }}
+          volumeMounts:
+            # The root filesystem is read-only, so anything needing a scratch path gets a
+            # named volume. Node writes nothing itself; this exists for the OS temp
+            # directory that libraries assume is available.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

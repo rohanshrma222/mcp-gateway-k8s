@@ -28,3 +28,27 @@ is why the values files let you supply an existingSecret instead for production.
 {{- randAlphaNum (.length | default 32) | b64enc -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The same generate-but-stable pattern, for a value that must be HEX.
+
+`randAlphaNum` returns mixed-case alphanumerics, which is fine for a password and wrong
+for a key with a declared encoding. The gateway's ENCRYPTION_KEY is an AES-256-GCM key
+validated as exactly 64 lowercase hex characters, and a generated value that fails that
+validation would be a chart that installs and a pod that refuses to start.
+
+sha256sum of a random string gives exactly 64 lowercase hex characters. The entropy comes
+from the random input, not from the hash - the hash is only doing the encoding.
+
+Hex rather than base64 for this key because the length is then unambiguous: 64 characters
+is 32 bytes, and a truncated value is obvious on sight rather than decoding to something
+short.
+*/}}
+{{- define "common.secretHexValue" -}}
+{{- $existing := lookup "v1" "Secret" .root.Release.Namespace .name -}}
+{{- if and $existing $existing.data (index $existing.data .key) -}}
+{{- index $existing.data .key -}}
+{{- else -}}
+{{- randAlphaNum 64 | sha256sum | b64enc -}}
+{{- end -}}
+{{- end -}}

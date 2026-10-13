@@ -1,0 +1,21 @@
+{{/*
+ClusterIP. The gateway is reachable from the browser only through the Ingress, which is
+added in 4.7 - so until then this name resolves inside the cluster and nowhere else.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "platform.gateway.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "gateway") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    {{- range .Values.gateway.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "gateway") | nindent 4 }}
