@@ -11,6 +11,7 @@ import { loadConfig } from './config.js';
 import { createPool } from './db.js';
 import { createLogger } from './logger.js';
 import { createMetrics } from './metrics.js';
+import { ClientPool } from './mcp/pool.js';
 import { initDummyHash } from './auth/passwords.js';
 
 // Exits non-zero with the offending field names if anything is missing or malformed.
@@ -18,6 +19,17 @@ const config = loadConfig();
 const logger = createLogger(config.LOG_LEVEL);
 const db = createPool(config, logger);
 const metrics = createMetrics(config.METRICS_ENABLED);
+
+/**
+ * One pool per replica, constructed here rather than inside buildApp so the shutdown
+ * handler can close it. Nothing connects yet - the pool is lazy, so a dead upstream
+ * cannot delay startup.
+ */
+const pool = new ClientPool({
+  logger,
+  allowlist: config.UPSTREAM_ALLOWLIST,
+  privateHosts: config.UPSTREAM_PRIVATE_HOSTS,
+});
 
 
 /**
@@ -37,7 +49,7 @@ async function main(): Promise<void> {
   // timing signal, which is the problem it exists to remove.
   await initDummyHash();
 
-  const app = await buildApp({ config, logger, db, metrics });
+  const app = await buildApp({ config, logger, db, metrics, pool });
   appRef = app;
 
   // 0.0.0.0, not localhost. A server bound to the loopback interface inside a container
@@ -87,6 +99,10 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'shutting down');
   try {
     if (appRef !== undefined) await appRef.close();
+    // Upstream connections close after the HTTP server stops accepting work and before
+    // the database pool drains: an in-flight tool call still needs both, and closing
+    // either first would fail the very requests the drain exists to protect.
+    await pool.closeAll();
     await db.end();
     logger.info('shutdown complete');
     process.exit(0);

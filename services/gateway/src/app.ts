@@ -12,6 +12,7 @@
 import { randomUUID } from 'node:crypto';
 import cookie from '@fastify/cookie';
 import Fastify, { LogController, type FastifyError } from 'fastify';
+import { ClientPool } from './mcp/pool.js';
 import { makeRequireApiKey } from './auth/bearer.js';
 import { makeRequireAuth, requireRole } from './auth/middleware.js';
 import { authRoutes } from './routes/auth.js';
@@ -24,6 +25,8 @@ import type { Logger } from './logger.js';
 import type { Metrics } from './metrics.js';
 
 export interface AppDeps {
+  /** This replica’s MCP client pool, constructed in index.ts so shutdown can close it. */
+  pool: ClientPool;
   config: Config;
   logger: Logger;
   db: Db;
@@ -41,7 +44,7 @@ const READYZ_BUDGET_MS = 2_000;
  * genuinely a different type and annotating it is a lie the compiler correctly rejects.
  * Inferring keeps the real type, and `App` below gives callers a name for it.
  */
-export async function buildApp({ config, logger, db, metrics }: AppDeps) {
+export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
   const app = Fastify({
     // Fastify logs through pino natively, so handing it the configured instance means
     // application logs and request logs share one stream, one redaction list and one
@@ -112,6 +115,7 @@ export async function buildApp({ config, logger, db, metrics }: AppDeps) {
       encryptionKey: config.ENCRYPTION_KEY,
       upstreamAllowlist: config.UPSTREAM_ALLOWLIST,
       upstreamPrivateHosts: config.UPSTREAM_PRIVATE_HOSTS,
+      pool,
       requireAuth: requireAuth as never,
       requireAdmin: requireRole('admin') as never,
     }),

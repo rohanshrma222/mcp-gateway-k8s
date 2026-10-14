@@ -17,6 +17,8 @@ import { z } from 'zod';
 import type { Principal } from '../auth/middleware.js';
 import { encryptCredential } from '../crypto/credentials.js';
 import { checkUrl, describeRejection } from '../security/ssrf.js';
+import { UpstreamUnavailableError, type ClientPool } from '../mcp/pool.js';
+import { CredentialError, loadUpstream } from '../mcp/upstreams.js';
 import type { Db } from '../db.js';
 
 /**
@@ -104,6 +106,8 @@ export interface ServerRouteDeps {
   upstreamAllowlist: string[];
   /** The subset additionally permitted to resolve into private space. */
   upstreamPrivateHosts: string[];
+  /** This replica’s MCP client pool. See mcp/pool.ts. */
+  pool: ClientPool;
   requireAuth: (request: never, reply: never) => Promise<void>;
   requireAdmin: (request: never, reply: never) => Promise<void>;
 }
@@ -468,6 +472,103 @@ export function serverRoutes(deps: ServerRouteDeps) {
       );
 
       return reply.send({ ok: true, slug: row.slug, requestId: request.id });
+    });
+
+    /**
+     * POST /api/servers/:id/test - connect to this upstream now and report what happened.
+     *
+     * The admin-facing "test connection" action, and the first caller of the MCP client
+     * pool. It exists in this step rather than later for the same reason `requireRole`
+     * got a route in 4.3: a component with no caller is a component nobody has tested,
+     * and the pool is where credential decryption, SSRF re-validation and reconnect
+     * backoff all actually happen.
+     *
+     * It is NOT the health prober. That is 5.2 and runs on a timer, persisting status to
+     * `mcp_servers` for every replica and the dashboard to read. This is the on-demand
+     * version an admin wants the moment they paste a URL, and it answers about THIS
+     * replica's pool, which is the honest scope - each replica keeps its own connections.
+     *
+     * The tool names are returned unprefixed, exactly as the upstream reports them.
+     * Prefixing and collision handling are 5.3; showing the raw names here is what lets
+     * an admin confirm they registered the server they meant to.
+     */
+    app.post('/api/servers/:id/test', admin, async (request, reply) => {
+      const parsed = idParam.safeParse(request.params);
+      if (!parsed.success) return reply.code(400).send({ error: 'a server id is required' });
+
+      let loaded;
+      try {
+        loaded = await loadUpstream(deps.db, deps.encryptionKey, parsed.data.id);
+      } catch (error) {
+        /**
+         * A credential that will not decrypt is a 200 with a failure inside, not a 500.
+         *
+         * The request succeeded - we looked, and the answer is "this upstream is
+         * unusable, here is why". A 500 would say the gateway is broken, which sends an
+         * operator to the wrong logs. Same distinction as woo-mcp's isError results.
+         */
+        if (error instanceof CredentialError) {
+          return reply.send({
+            status: 'unreachable',
+            reason: error.message,
+            toolCount: 0,
+            requestId: request.id,
+          });
+        }
+        throw error;
+      }
+
+      if (loaded === undefined) return reply.code(404).send({ error: 'no such upstream' });
+
+      if (!loaded.enabled) {
+        // Reported rather than attempted. Connecting to a disabled upstream would be
+        // doing the thing the admin switched off, and "disabled" is a different answer
+        // from "unreachable" - one is a decision, the other is a fault.
+        return reply.send({
+          status: 'disabled',
+          reason: 'this upstream is disabled; enable it before testing',
+          toolCount: 0,
+          requestId: request.id,
+        });
+      }
+
+      try {
+        // pool.use rather than pool.get: the pool owns the failure accounting, so a
+        // call that fails on an established connection drops it and starts the backoff.
+        // Using get() here was the first version, and it left a dead upstream reporting
+        // "connected" forever while every call paid the full timeout.
+        const listed = await deps.pool.use(loaded.target, (client) =>
+          client.listTools({}, { timeout: loaded.target.timeoutMs }),
+        );
+
+        request.log.info(
+          { slug: loaded.target.slug, toolCount: listed.tools.length },
+          'upstream test succeeded',
+        );
+
+        return reply.send({
+          status: 'connected',
+          toolCount: listed.tools.length,
+          tools: listed.tools.map((tool) => tool.name),
+          requestId: request.id,
+        });
+      } catch (error) {
+        const reason =
+          error instanceof UpstreamUnavailableError
+            ? error.reason
+            : error instanceof Error
+              ? error.message.slice(0, 200)
+              : String(error).slice(0, 200);
+
+        // Also a 200: the test ran and its result is "no". The reason is the thing the
+        // brief asks the dashboard to display instead of a bare "Unreachable".
+        return reply.send({
+          status: deps.pool.entry(parsed.data.id).status,
+          reason,
+          toolCount: 0,
+          requestId: request.id,
+        });
+      }
     });
   };
 }
