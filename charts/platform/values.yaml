@@ -127,6 +127,12 @@ gateway:
   # headroom for the migration Job and an administrator's psql session.
   poolMax: 10
   upstreamProbeIntervalSeconds: 15
+  # Per-probe timeout, deliberately far below upstreamTimeoutSeconds. A probe is a liveness
+  # question: 3s says "answer promptly or you are not healthy". Using the 20s tool-call
+  # budget would let one slow upstream consume more than a whole probe interval by itself,
+  # so cycles would overlap and the prober would spend its life waiting on the least
+  # healthy thing it monitors.
+  upstreamProbeTimeoutMs: 3000
   upstreamTimeoutSeconds: 20
   rateLimit:
     enabled: true

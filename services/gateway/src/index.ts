@@ -12,6 +12,7 @@ import { createPool } from './db.js';
 import { createLogger } from './logger.js';
 import { createMetrics } from './metrics.js';
 import { ClientPool } from './mcp/pool.js';
+import { HealthProber } from './mcp/prober.js';
 import { initDummyHash } from './auth/passwords.js';
 
 // Exits non-zero with the offending field names if anything is missing or malformed.
@@ -29,6 +30,23 @@ const pool = new ClientPool({
   logger,
   allowlist: config.UPSTREAM_ALLOWLIST,
   privateHosts: config.UPSTREAM_PRIVATE_HOSTS,
+});
+
+/**
+ * The health prober, started after the server is listening rather than before.
+ *
+ * Order matters: starting it first would mean the first probe cycle runs while the process
+ * is not yet answering /readyz, so a slow cycle delays the pod becoming ready for a reason
+ * that has nothing to do with readiness.
+ */
+const prober = new HealthProber({
+  db,
+  logger,
+  metrics,
+  pool,
+  encryptionKey: config.ENCRYPTION_KEY,
+  intervalMs: config.UPSTREAM_PROBE_INTERVAL_MS,
+  probeTimeoutMs: config.UPSTREAM_PROBE_TIMEOUT_MS,
 });
 
 
@@ -57,6 +75,8 @@ async function main(): Promise<void> {
   // readiness probe failing with "connection refused" on a process that is running
   // perfectly.
   await app.listen({ host: '0.0.0.0', port: config.PORT });
+
+  prober.start();
 
   logger.info(
     {
@@ -98,6 +118,10 @@ async function shutdown(signal: string): Promise<void> {
 
   logger.info({ signal }, 'shutting down');
   try {
+    // The prober stops FIRST. It holds no request, so draining it is instant - and
+    // leaving it running during the drain would have it opening upstream connections
+    // while closeAll is trying to close them.
+    prober.stop();
     if (appRef !== undefined) await appRef.close();
     // Upstream connections close after the HTTP server stops accepting work and before
     // the database pool drains: an in-flight tool call still needs both, and closing

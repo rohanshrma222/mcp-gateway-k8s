@@ -105,6 +105,17 @@ const schema = z.object({
         .filter((entry) => entry.length > 0),
     ),
 
+  /** How often the health prober sweeps every enabled upstream. */
+  UPSTREAM_PROBE_INTERVAL_MS: z.coerce.number().int().min(1000).max(600_000).default(15_000),
+
+  /**
+   * Per-probe timeout, far shorter than a tool call budget on purpose. A probe is a
+   * liveness question, not a unit of work: if it used the 20s tool-call budget then one
+   * slow upstream would consume more than a whole probe interval by itself. Capped below
+   * the interval so a cycle cannot structurally outlast its own schedule.
+   */
+  UPSTREAM_PROBE_TIMEOUT_MS: z.coerce.number().int().min(500).max(10_000).default(3_000),
+
   METRICS_ENABLED: z
     .enum(['true', 'false'])
     .default('true')

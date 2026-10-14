@@ -111,6 +111,12 @@ spec:
               value: {{ join "," .Values.gateway.upstreamPrivateHosts | quote }}
             - name: COOKIE_SECURE
               value: {{ .Values.gateway.cookieSecure | quote }}
+            - name: UPSTREAM_PROBE_INTERVAL_MS
+              value: {{ mul .Values.gateway.upstreamProbeIntervalSeconds 1000 | quote }}
+            # Much shorter than upstreamTimeoutSeconds: a probe asks whether an upstream is
+            # alive, not whether it can finish a unit of work. See mcp/prober.ts.
+            - name: UPSTREAM_PROBE_TIMEOUT_MS
+              value: {{ .Values.gateway.upstreamProbeTimeoutMs | quote }}
             - name: METRICS_ENABLED
               value: {{ .Values.metrics.enabled | quote }}
           volumeMounts:
