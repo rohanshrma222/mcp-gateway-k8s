@@ -110,6 +110,7 @@ export async function buildApp({ config, logger, db, metrics }: AppDeps) {
     serverRoutes({
       db,
       encryptionKey: config.ENCRYPTION_KEY,
+      upstreamAllowlist: config.UPSTREAM_ALLOWLIST,
       requireAuth: requireAuth as never,
       requireAdmin: requireRole('admin') as never,
     }),

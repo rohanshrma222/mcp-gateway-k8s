@@ -33,7 +33,8 @@ RUN npm run build --workspace @urumi/woo-mcp
 # removal, because a layer records the deletion rather than undoing the write.
 RUN rm -rf node_modules services/woo-mcp/node_modules \
     && npm ci --omit=dev --workspace @urumi/woo-mcp --include-workspace-root \
-    && npm cache clean --force
+    && npm cache clean --force \
+    && mkdir -p services/woo-mcp/node_modules
 
 # ---------------------------------------------------------------------------- runtime
 
@@ -46,9 +47,21 @@ ENV NODE_ENV=production
 # there is a permission error at startup rather than at review time.
 ENV NODE_OPTIONS=--enable-source-maps
 
+# The WORKSPACE LAYOUT is preserved rather than flattened into /app/dist.
+#
+# npm hoists workspace dependencies to the root node_modules when it can, and nests them
+# under the workspace when it cannot - because another package already holds that name at
+# a different major. Copying only the root node_modules therefore drops any nested
+# package, and the container dies at startup with ERR_MODULE_NOT_FOUND.
+#
+# Nothing nests for this service today. The flaw was found in services/gateway, where
+# ipaddr.js could not hoist past a transitive 1.9.1, and it is fixed here as well because
+# the next dependency with a version conflict would break this image the same way with no
+# warning. Keeping the layout lets Node resolve exactly as it does in development.
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
-COPY --from=build --chown=node:node /app/services/woo-mcp/dist ./dist
-COPY --from=build --chown=node:node /app/services/woo-mcp/package.json ./package.json
+COPY --from=build --chown=node:node /app/services/woo-mcp/node_modules ./services/woo-mcp/node_modules
+COPY --from=build --chown=node:node /app/services/woo-mcp/dist ./services/woo-mcp/dist
+COPY --from=build --chown=node:node /app/services/woo-mcp/package.json ./services/woo-mcp/package.json
 
 # Non-root in the image itself, not only in the pod spec. The chart sets runAsNonRoot and
 # would reject a root image, but a container that is only safe because of how it is
@@ -63,4 +76,4 @@ EXPOSE 3000
 # Exec form, so node is PID 1 and receives SIGTERM directly. The shell form would wrap it
 # in /bin/sh, which does not forward signals, so graceful shutdown would never run and
 # every rollout would kill in-flight tool calls.
-CMD ["node", "dist/index.js"]
+CMD ["node", "services/woo-mcp/dist/index.js"]

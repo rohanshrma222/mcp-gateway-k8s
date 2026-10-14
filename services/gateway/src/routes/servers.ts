@@ -16,6 +16,7 @@ import type { FastifyInstance, FastifyPluginOptions } from 'fastify';
 import { z } from 'zod';
 import type { Principal } from '../auth/middleware.js';
 import { encryptCredential } from '../crypto/credentials.js';
+import { checkUrl, describeRejection } from '../security/ssrf.js';
 import type { Db } from '../db.js';
 
 /**
@@ -99,6 +100,8 @@ function validateAuthShape(state: ResultingState): string | undefined {
 export interface ServerRouteDeps {
   db: Db;
   encryptionKey: string;
+  /** Hostname patterns permitted to resolve to private addresses. See security/ssrf.ts. */
+  upstreamAllowlist: string[];
   requireAuth: (request: never, reply: never) => Promise<void>;
   requireAdmin: (request: never, reply: never) => Promise<void>;
 }
@@ -183,11 +186,20 @@ export function serverRoutes(deps: ServerRouteDeps) {
         return reply.code(400).send({ error: shapeError });
       }
 
-      // NOTE: URL validation here is only "is this a URL". The SSRF guard - rejecting
-      // loopback, private, link-local and CGNAT addresses, resolving every A/AAAA record,
-      // and re-validating at call time against DNS rebinding - is step 4.6 and hooks in
-      // at exactly this point. Until then an admin can register an arbitrary URL, which
-      // is stated plainly rather than implied.
+      // The SSRF guard. Runs before anything is written, so a rejected URL never reaches
+      // the database and never gets a credential encrypted for it.
+      const guard = await checkUrl(body.url, { allowlist: deps.upstreamAllowlist });
+      if (!guard.ok) {
+        request.log.warn(
+          { url: body.url, reason: guard.reason.kind },
+          'upstream registration refused by the SSRF guard',
+        );
+        return reply.code(400).send({
+          error: `this URL is not allowed as an upstream: ${describeRejection(guard.reason)}`,
+          reason: guard.reason.kind,
+        });
+      }
+
       const id = randomUUID();
       const encrypted =
         body.credential === undefined
@@ -346,6 +358,24 @@ export function serverRoutes(deps: ServerRouteDeps) {
         hasCredential: nextHasCredential,
       });
       if (shapeError !== undefined) return reply.code(400).send({ error: shapeError });
+
+      // The guard runs on PATCH too, and it has to: an upstream registered with a
+      // harmless URL and then edited to point at 169.254.169.254 is the same attack with
+      // one extra request. Only when the URL is actually changing, so an unrelated PATCH
+      // does not pay a DNS resolution.
+      if (body.url !== undefined) {
+        const guard = await checkUrl(body.url, { allowlist: deps.upstreamAllowlist });
+        if (!guard.ok) {
+          request.log.warn(
+            { serverId: id, url: body.url, reason: guard.reason.kind },
+            'upstream update refused by the SSRF guard',
+          );
+          return reply.code(400).send({
+            error: `this URL is not allowed as an upstream: ${describeRejection(guard.reason)}`,
+            reason: guard.reason.kind,
+          });
+        }
+      }
 
       const encrypted =
         body.credential !== undefined && !clearCredential
