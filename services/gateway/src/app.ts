@@ -12,8 +12,11 @@
 import { randomUUID } from 'node:crypto';
 import cookie from '@fastify/cookie';
 import Fastify, { LogController, type FastifyError } from 'fastify';
+import { makeRequireApiKey } from './auth/bearer.js';
 import { makeRequireAuth } from './auth/middleware.js';
 import { authRoutes } from './routes/auth.js';
+import { keyRoutes } from './routes/keys.js';
+import { mcpRoutes } from './routes/mcp.js';
 import type { Config } from './config.js';
 import { pingDb, type Db } from './db.js';
 import type { Logger } from './logger.js';
@@ -99,6 +102,15 @@ export async function buildApp({ config, logger, db, metrics }: AppDeps) {
       requireAuth: requireAuth as never,
     }),
   );
+
+  await app.register(keyRoutes({ db, requireAuth: requireAuth as never }));
+
+  // The machine door. A completely separate resolver from the session middleware above:
+  // different credential, different lifetime, different revocation story. Sharing one
+  // resolver would be one `if` away from letting a session cookie authenticate a tool
+  // call, or a long-lived API key drive the dashboard admin routes.
+  const requireApiKey = makeRequireApiKey({ db });
+  await app.register(mcpRoutes({ requireApiKey: requireApiKey as never }));
 
   // Echo the request id back on every response, including errors. Without this, a user
   // reporting "it failed" has nothing to correlate against the logs, and the id is only
