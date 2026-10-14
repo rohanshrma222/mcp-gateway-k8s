@@ -1,0 +1,54 @@
+{{- $ctx := dict "root" $ "component" "dashboard" "spec" .Values.dashboard }}
+{{/*
+Step 4.7 - the dashboard, as static files behind nginx.
+
+A Deployment with no state at all: nginx serves files baked into the image, so a replica
+is interchangeable and nothing needs to be shared between them. That is also why there is
+no PVC and no ConfigMap holding content - the content IS the image, so "which version is
+running" is answered by the image tag rather than by inspecting a volume.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "platform.dashboard.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ .Values.dashboard.replicas }}
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: dashboard
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          volumeMounts:
+            # nginx needs exactly two writable paths, and naming them is what lets the
+            # root filesystem stay read-only. /var/cache/nginx holds proxy and fastcgi
+            # temp directories, which nginx creates at startup whether or not it will use
+            # them; /tmp holds the pid file, because this image is configured to write it
+            # there rather than to /run.
+            #
+            # The alternative - readOnlyRootFilesystem: false - would make every path
+            # writable to buy what two named directories buy.
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

@@ -1,0 +1,49 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ctx := dict "root" $ "component" "dashboard" }}
+{{/*
+The dashboard accepts traffic from the ingress controller and from nothing else, and sends
+none at all.
+
+The egress rule is the interesting half: `policyTypes: Egress` with an EMPTY egress list
+means "this pod may not initiate any outbound connection". That is correct here and it is
+unusual enough to be worth stating - nginx serving files baked into its own image has
+nothing to call. It does not even need DNS, because there is no upstream to resolve.
+
+So this is the one workload in the platform that is fully outbound-isolated. If a static
+asset in this image were ever malicious - a compromised npm package reaching the Vite
+build in stage 7 is the realistic path - it could not phone home from the server side. It
+could still run in the visitor's browser, which is what the Content-Security-Policy in
+nginx.conf is for; the two controls cover different halves of the same risk.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "platform.dashboard.name" . }}-allow
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        # namespaceSelector AND podSelector in ONE entry: a pod with the Traefik labels,
+        # in the Traefik namespace. As two entries they would be ORed, which is far weaker
+        # and looks nearly identical.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.ingressNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressPodLabels | nindent 14 }}
+      ports:
+        {{- range .Values.dashboard.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .name }}
+        {{- end }}
+  # Deliberately empty. See the note above: no outbound connections, not even DNS.
+  egress: []
+{{- end }}

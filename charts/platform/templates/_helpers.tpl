@@ -58,3 +58,20 @@ the other, and `values-prod.yaml` can point each at a different externally manag
 {{- define "platform.seed.name" -}}
 {{- include "common.componentName" (dict "root" . "component" "seed") -}}
 {{- end -}}
+
+{{/*
+Maps the logical service name used in `ingress.paths[].service` to the rendered Service
+name, so the values file can say `gateway` rather than repeating a fullname template.
+A name that is not one of the two is a `fail`, because the alternative is an Ingress that
+renders happily and routes to a Service that does not exist.
+*/}}
+{{- define "platform.ingressBackend" -}}
+{{- $name := .name -}}
+{{- if eq $name "gateway" -}}
+{{- include "platform.gateway.name" .root -}}
+{{- else if eq $name "dashboard" -}}
+{{- include "platform.dashboard.name" .root -}}
+{{- else -}}
+{{- fail (printf "ingress.paths: unknown service %q (expected \"gateway\" or \"dashboard\")" $name) -}}
+{{- end -}}
+{{- end -}}

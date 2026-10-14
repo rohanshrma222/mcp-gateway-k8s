@@ -1,0 +1,22 @@
+{{/*
+ClusterIP. The dashboard is reachable from a browser only through the Ingress, which is
+the same single host that serves /api and /mcp - see ingress.yaml for why that matters
+more than it looks.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "platform.dashboard.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "dashboard") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    {{- range .Values.dashboard.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "dashboard") | nindent 4 }}

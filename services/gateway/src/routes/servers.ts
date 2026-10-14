@@ -100,8 +100,10 @@ function validateAuthShape(state: ResultingState): string | undefined {
 export interface ServerRouteDeps {
   db: Db;
   encryptionKey: string;
-  /** Hostname patterns permitted to resolve to private addresses. See security/ssrf.ts. */
+  /** Hosts that may be registered at all. Mandatory and default-deny. */
   upstreamAllowlist: string[];
+  /** The subset additionally permitted to resolve into private space. */
+  upstreamPrivateHosts: string[];
   requireAuth: (request: never, reply: never) => Promise<void>;
   requireAdmin: (request: never, reply: never) => Promise<void>;
 }
@@ -188,7 +190,10 @@ export function serverRoutes(deps: ServerRouteDeps) {
 
       // The SSRF guard. Runs before anything is written, so a rejected URL never reaches
       // the database and never gets a credential encrypted for it.
-      const guard = await checkUrl(body.url, { allowlist: deps.upstreamAllowlist });
+      const guard = await checkUrl(body.url, {
+          allowlist: deps.upstreamAllowlist,
+          privateHosts: deps.upstreamPrivateHosts,
+        });
       if (!guard.ok) {
         request.log.warn(
           { url: body.url, reason: guard.reason.kind },
@@ -364,7 +369,10 @@ export function serverRoutes(deps: ServerRouteDeps) {
       // one extra request. Only when the URL is actually changing, so an unrelated PATCH
       // does not pay a DNS resolution.
       if (body.url !== undefined) {
-        const guard = await checkUrl(body.url, { allowlist: deps.upstreamAllowlist });
+        const guard = await checkUrl(body.url, {
+          allowlist: deps.upstreamAllowlist,
+          privateHosts: deps.upstreamPrivateHosts,
+        });
         if (!guard.ok) {
           request.log.warn(
             { serverId: id, url: body.url, reason: guard.reason.kind },

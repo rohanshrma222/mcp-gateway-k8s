@@ -45,23 +45,42 @@ const ALLOWED_SCHEMES = new Set(['http:', 'https:']);
  * 169.254.169.254 - it is not special-cased because it is not special: the whole range is
  * unreachable-by-policy, and naming only the one address would leave 169.254.169.253.
  */
-const BLOCKED_IPV4_RANGES = new Set([
+const ALWAYS_BLOCKED_IPV4 = new Set([
   'unspecified', // 0.0.0.0/8
   'broadcast', // 255.255.255.255
   'multicast', // 224.0.0.0/4
   'linkLocal', // 169.254.0.0/16 - includes cloud metadata
   'loopback', // 127.0.0.0/8
-  'carrierGradeNat', // 100.64.0.0/10
-  'private', // 10/8, 172.16/12, 192.168/16
   'reserved', // 192.0.2.0/24, 240.0.0.0/4 and friends
 ]);
 
-const BLOCKED_IPV6_RANGES = new Set([
+/**
+ * Private space, which is blocked for everything EXCEPT hosts on the internal list.
+ *
+ * Separating these two sets is a correction to the first version of this guard, and the
+ * hole it closes is worth recording. That version let any allowlisted host skip every
+ * address check, on the reasoning that cluster services legitimately live on private
+ * addresses. But "skip every check" also skipped loopback and link-local - and a caller
+ * who can create a Service in any namespace they control can make a cluster name resolve
+ * wherever they like. An ExternalName Service, or a hand-written Endpoints object, turns
+ * `mine.my-ns.svc.cluster.local` into a name that resolves to 169.254.169.254 and is
+ * allowlisted by suffix. The guard would have waved it through.
+ *
+ * So the exemption is now narrow: an internal host may resolve into PRIVATE space, which
+ * is the thing cluster DNS legitimately does. Nothing may resolve to loopback, link-local,
+ * multicast or the other reserved ranges - not even a name ending in .svc.cluster.local,
+ * because there is no legitimate configuration in which it would.
+ */
+const PRIVATE_IPV4 = new Set([
+  'carrierGradeNat', // 100.64.0.0/10
+  'private', // 10/8, 172.16/12, 192.168/16
+]);
+
+const ALWAYS_BLOCKED_IPV6 = new Set([
   'unspecified', // ::
   'linkLocal', // fe80::/10
   'multicast', // ff00::/8
   'loopback', // ::1
-  'uniqueLocal', // fc00::/7 - the IPv6 equivalent of private
   'rfc6145', // ::ffff:0:0:0/96 translated
   'rfc6052', // 64:ff9b::/96
   '6to4', // 2002::/16
@@ -69,11 +88,15 @@ const BLOCKED_IPV6_RANGES = new Set([
   'reserved', // 2001:db8::/32 documentation and others
 ]);
 
+/** fc00::/7, the IPv6 equivalent of private. See PRIVATE_IPV4. */
+const PRIVATE_IPV6 = new Set(['uniqueLocal']);
+
 export type RejectionReason =
   | { kind: 'scheme'; detail: string }
   | { kind: 'credentials'; detail: string }
   | { kind: 'malformed'; detail: string }
   | { kind: 'unresolvable'; detail: string }
+  | { kind: 'host-not-allowed'; detail: string }
   | { kind: 'blocked-address'; detail: string };
 
 export type GuardResult =
@@ -148,7 +171,7 @@ export function matchesAllowlist(hostname: string, patterns: string[]): boolean 
  * and then connect to localhost. So a mapped address is converted and re-classified under
  * the IPv4 rules.
  */
-function addressRejection(address: string): string | undefined {
+function addressRejection(address: string, allowPrivate: boolean): string | undefined {
   let parsed;
   try {
     parsed = ipaddr.parse(address);
@@ -159,8 +182,7 @@ function addressRejection(address: string): string | undefined {
   }
 
   if (parsed.kind() === 'ipv4') {
-    const range = parsed.range();
-    return BLOCKED_IPV4_RANGES.has(range) ? `${address} is in the ${range} range` : undefined;
+    return classify(address, parsed.range(), ALWAYS_BLOCKED_IPV4, PRIVATE_IPV4, allowPrivate);
   }
 
   const v6 = parsed as ipaddr.IPv6;
@@ -168,17 +190,64 @@ function addressRejection(address: string): string | undefined {
 
   if (range === 'ipv4Mapped') {
     const mapped = v6.toIPv4Address();
-    const mappedRange = mapped.range();
-    return BLOCKED_IPV4_RANGES.has(mappedRange)
-      ? `${address} maps to IPv4 ${mapped.toString()}, which is in the ${mappedRange} range`
-      : undefined;
+    const rejection = classify(
+      mapped.toString(),
+      mapped.range(),
+      ALWAYS_BLOCKED_IPV4,
+      PRIVATE_IPV4,
+      allowPrivate,
+    );
+    return rejection === undefined ? undefined : `${address} maps to IPv4 ${rejection}`;
   }
 
-  return BLOCKED_IPV6_RANGES.has(range) ? `${address} is in the ${range} range` : undefined;
+  return classify(address, range, ALWAYS_BLOCKED_IPV6, PRIVATE_IPV6, allowPrivate);
+}
+
+/**
+ * One place where the always-blocked / private-when-internal decision is made, so the
+ * IPv4, IPv6 and IPv4-mapped paths cannot drift apart on it.
+ */
+function classify(
+  address: string,
+  range: string,
+  alwaysBlocked: Set<string>,
+  privateRanges: Set<string>,
+  allowPrivate: boolean,
+): string | undefined {
+  if (alwaysBlocked.has(range)) {
+    return `${address} is in the ${range} range, which is never permitted`;
+  }
+  if (privateRanges.has(range) && !allowPrivate) {
+    return `${address} is in the ${range} range, which is only permitted for hosts on the internal allowlist`;
+  }
+  return undefined;
 }
 
 export interface GuardOptions {
+  /**
+   * Hosts that may be registered at all. **Mandatory and default-deny**: a host that
+   * matches nothing here is refused, however public and harmless its addresses are.
+   *
+   * This is the stricter reading of the requirement, and the first version of this guard
+   * got it wrong - it treated the list as an exemption that let cluster names reach
+   * private space, while permitting any public host by default. That makes the gateway a
+   * general-purpose outbound fetcher the moment someone registers an upstream, and an
+   * admin account becomes a way to make the cluster talk to the internet on request.
+   *
+   * Default-deny means adding a genuinely external upstream is a deliberate, reviewable
+   * act: someone edits Helm values and redeploys, rather than typing a URL into a form.
+   */
   allowlist: string[];
+  /**
+   * The subset of hosts additionally permitted to resolve into PRIVATE address space.
+   *
+   * Separate from `allowlist` because the two questions are different. "May this host be
+   * registered" is about trust in the operator's intent. "May this host live on a private
+   * address" is about whether private space is where it legitimately lives - true for
+   * in-cluster Services, false for a vendor's hosted MCP server, which should resolve
+   * publicly and whose resolving privately would be a sign something is wrong.
+   */
+  privateHosts: string[];
   /** Defaults to real DNS. Overridden in tests, including to simulate rebinding. */
   resolver?: Resolver;
 }
@@ -247,11 +316,44 @@ export async function checkUrl(rawUrl: string, options: GuardOptions): Promise<G
    * though note the URL parser normalises most of those spellings before we see them.
    */
   if (ipaddr.isValid(host)) {
-    const rejection = addressRejection(host);
+    // A literal address is checked directly and is NEVER exempted by either list. This
+    // closes the obvious hole in a host-based allowlist: if `10.0.0.1` could be waived by
+    // naming it, the allowlist would become the bypass. The lists describe NAMES that DNS
+    // answers for, never addresses the caller chose - so `allowPrivate` is false here
+    // unconditionally, and a literal public address is still refused below for not being
+    // an allowlisted host.
+    const rejection = addressRejection(host, false);
     if (rejection !== undefined) {
       return { ok: false, reason: { kind: 'blocked-address', detail: rejection } };
     }
+    if (!matchesAllowlist(host, options.allowlist)) {
+      return {
+        ok: false,
+        reason: {
+          kind: 'host-not-allowed',
+          detail: `${host} is not on the upstream allowlist; add it to gateway.upstreamAllowlist in Helm values if it is genuinely intended`,
+        },
+      };
+    }
     return { ok: true, host, addresses: [host] };
+  }
+
+  /**
+   * The host allowlist, checked BEFORE resolving.
+   *
+   * Before, because it is cheaper and because a refused host should not cost a DNS query -
+   * and more importantly because it means an attacker cannot use this endpoint to make the
+   * gateway resolve arbitrary names for them, which is a small exfiltration channel in its
+   * own right (DNS to a name they control confirms the request reached us).
+   */
+  if (!matchesAllowlist(host, options.allowlist)) {
+    return {
+      ok: false,
+      reason: {
+        kind: 'host-not-allowed',
+        detail: `${host} is not on the upstream allowlist; add it to gateway.upstreamAllowlist in Helm values if it is genuinely intended`,
+      },
+    };
   }
 
   const resolver = options.resolver ?? resolveAll;
@@ -276,30 +378,27 @@ export async function checkUrl(rawUrl: string, options: GuardOptions): Promise<G
   }
 
   /**
-   * The allowlist is applied AFTER resolution, not instead of it.
+   * Address checks ALWAYS run, for every host, including allowlisted ones.
    *
-   * An allowed name still has to resolve - a name that resolves to nothing is rejected
-   * above regardless - but once it does, a private address is permitted for it. The order
-   * matters because it means the allowlist cannot be used to skip the "does this exist"
-   * question, only the "is this address public" one.
+   * The only thing membership of `privateHosts` changes is whether private space is
+   * acceptable. Loopback, link-local, multicast and the reserved ranges are refused for
+   * everybody - see PRIVATE_IPV4 for the attack that made this distinction necessary.
    */
-  const allowlisted = matchesAllowlist(host, options.allowlist);
+  const allowPrivate = matchesAllowlist(host, options.privateHosts);
 
-  if (!allowlisted) {
-    // EVERY address must pass. See the note at the top of this file: a hostname with one
-    // public and one loopback A record passes a first-address check intermittently, which
-    // is the worst possible behaviour for a security control.
-    for (const address of addresses) {
-      const rejection = addressRejection(address);
-      if (rejection !== undefined) {
-        return {
-          ok: false,
-          reason: {
-            kind: 'blocked-address',
-            detail: `${host} resolves to ${addresses.length} address(es) and ${rejection}`,
-          },
-        };
-      }
+  // EVERY address must pass. See the note at the top of this file: a hostname with one
+  // public and one loopback A record passes a first-address check intermittently, which
+  // is the worst possible behaviour for a security control.
+  for (const address of addresses) {
+    const rejection = addressRejection(address, allowPrivate);
+    if (rejection !== undefined) {
+      return {
+        ok: false,
+        reason: {
+          kind: 'blocked-address',
+          detail: `${host} resolves to ${addresses.length} address(es) and ${rejection}`,
+        },
+      };
     }
   }
 

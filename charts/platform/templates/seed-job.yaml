@@ -64,7 +64,9 @@ spec:
       containers:
         - name: seed
           {{- include "common.jobContainerDefaults" $ctx | nindent 10 }}
-          command: ['node', 'dist/seed.js']
+          # The path mirrors the image, which preserves the npm workspace layout rather
+          # than flattening it to /app/dist - see services/gateway/Dockerfile for why.
+          command: ['node', 'services/gateway/dist/seed.js']
           env:
             - name: LOG_LEVEL
               value: {{ .Values.gateway.logLevel | quote }}

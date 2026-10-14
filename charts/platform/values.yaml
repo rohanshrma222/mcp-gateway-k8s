@@ -135,7 +135,25 @@ gateway:
   # candidate URL's addresses and rejects loopback, private, link-local and CGNAT space;
   # this allowlist is what re-admits the in-cluster services that are legitimately on
   # private addresses.
+  # MANDATORY and default-deny: a host matching nothing here cannot be registered,
+  # however public and harmless its addresses are. The first version of the SSRF guard
+  # treated this as an exemption and allowed any public host by default, which made the
+  # gateway a general-purpose outbound fetcher the moment someone registered an upstream.
+  # Adding a genuinely external upstream is therefore a deliberate, reviewable act: edit
+  # this list and redeploy, rather than typing a URL into a form.
   upstreamAllowlist:
+    - '*.svc.cluster.local'
+  # The subset additionally permitted to resolve into PRIVATE address space. Separate from
+  # the list above because the questions differ: "may this be registered" is about the
+  # operator's intent, while "may this live on a private address" is about whether private
+  # space is where it legitimately lives - true for in-cluster Services, false for a
+  # vendor's hosted server, where resolving privately would be a sign something is wrong.
+  #
+  # Note what is NOT exempted even here: loopback, link-local (cloud metadata), multicast
+  # and the reserved ranges are refused for every host. A caller who can create an
+  # ExternalName Service in a namespace they control could otherwise point an allowlisted
+  # cluster name at 169.254.169.254.
+  upstreamPrivateHosts:
     - '*.svc.cluster.local'
 
 # ------------------------------------------------------------------------ seed
@@ -173,14 +191,22 @@ dashboard:
     requests: { cpu: 25m, memory: 48Mi }
     limits: { cpu: 250m, memory: 128Mi }
   probes:
+    # /healthz is answered by nginx itself, not by a file on disk. Pointing these at `/`
+    # would make readiness depend on index.html being present and correct - so a broken
+    # build could still report ready, and an unrelated missing asset could report unready.
     readiness:
-      httpGet: { path: /, port: http }
+      httpGet: { path: /healthz, port: http }
       periodSeconds: 10
+      timeoutSeconds: 2
     liveness:
-      httpGet: { path: /, port: http }
+      httpGet: { path: /healthz, port: http }
       periodSeconds: 30
       failureThreshold: 6
+      timeoutSeconds: 2
   securityContext:
+    # nginx-unprivileged is uid/gid 101 and listens on 8080, so the pod needs no
+    # capabilities at all - and the root filesystem stays read-only because the two paths
+    # nginx writes to get emptyDir volumes. See dashboard-deployment.yaml.
     runAsUser: 101
     runAsGroup: 101
   ports:

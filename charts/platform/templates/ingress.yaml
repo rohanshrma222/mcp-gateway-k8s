@@ -1,0 +1,65 @@
+{{- if .Values.ingress.enabled }}
+{{/*
+One host, three paths. This is the object that makes the platform reachable from a
+browser, and the path ordering is the part worth explaining.
+
+  /api  -> gateway     REST for the dashboard: login, API keys, upstream registry
+  /mcp  -> gateway     the single MCP endpoint external clients connect to
+  /     -> dashboard   static files, and the SPA fallback for every client-side route
+
+The catch-all comes LAST in values, and that ordering is deliberate even though Ingress
+path matching is not supposed to depend on list order. Traefik derives a rule priority
+from the path length, so the longer, more specific prefixes win over `/` - but that is
+behaviour of this controller rather than a guarantee of the Ingress API. Writing them
+longest-first means the file reads the way the routing behaves, and anyone reading it does
+not have to know the priority rule to predict the outcome. It is verified rather than
+assumed: the gate for this step checks that `/api/...` reaches the gateway and `/` reaches
+nginx.
+
+**One host for all three, not a separate host for the API.** That is a security decision,
+not a convenience. The session cookie is `SameSite=Strict`, which means the browser only
+sends it on same-site requests - so the dashboard and the API being the same origin is
+what lets the cookie work at all without relaxing it to `Lax`. It is also what makes the
+dashboard's `connect-src 'self'` Content-Security-Policy sufficient: the page needs to
+talk to nothing but its own origin.
+
+No path points at `/metrics`. Prometheus scrapes it in-cluster, and publishing it would
+expose tool names, user counts and failure rates to anyone who asked.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "common.fullname" . }}
+  labels:
+    {{- /* common.labels takes the ROOT context directly, unlike common.componentLabels
+           and common.selectorLabels which take (dict "root" $ "component" ...). The
+           Ingress spans both components, so it carries no component label. */}}
+    {{- include "common.labels" $ | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.platform.host | quote }}
+      secretName: {{ .Values.ingress.tls.secretName | required "ingress.tls.secretName is required when TLS is enabled" }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.platform.host | quote }}
+      http:
+        paths:
+          {{- range .Values.ingress.paths }}
+          - path: {{ .path }}
+            # Prefix, not Exact: /api has to match /api/auth/login, and / has to match
+            # every client-side route for the SPA fallback to work.
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "platform.ingressBackend" (dict "root" $ "name" .service) }}
+                port:
+                  name: {{ .port }}
+          {{- end }}
+{{- end }}

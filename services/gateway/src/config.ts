@@ -89,6 +89,22 @@ const schema = z.object({
     )
     .refine((list) => list.length > 0, 'UPSTREAM_ALLOWLIST must contain at least one pattern'),
 
+  /**
+   * The subset of allowlisted hosts additionally permitted to resolve into private
+   * address space - in practice the cluster-internal names. Separate from the allowlist
+   * because "may be registered" and "may live on a private address" are different
+   * questions. See security/ssrf.ts.
+   */
+  UPSTREAM_PRIVATE_HOSTS: z
+    .string()
+    .default('*.svc.cluster.local')
+    .transform((raw) =>
+      raw
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0),
+    ),
+
   METRICS_ENABLED: z
     .enum(['true', 'false'])
     .default('true')

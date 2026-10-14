@@ -111,6 +111,7 @@ export async function buildApp({ config, logger, db, metrics }: AppDeps) {
       db,
       encryptionKey: config.ENCRYPTION_KEY,
       upstreamAllowlist: config.UPSTREAM_ALLOWLIST,
+      upstreamPrivateHosts: config.UPSTREAM_PRIVATE_HOSTS,
       requireAuth: requireAuth as never,
       requireAdmin: requireRole('admin') as never,
     }),
