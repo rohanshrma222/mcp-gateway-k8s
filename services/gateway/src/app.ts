@@ -13,10 +13,11 @@ import { randomUUID } from 'node:crypto';
 import cookie from '@fastify/cookie';
 import Fastify, { LogController, type FastifyError } from 'fastify';
 import { makeRequireApiKey } from './auth/bearer.js';
-import { makeRequireAuth } from './auth/middleware.js';
+import { makeRequireAuth, requireRole } from './auth/middleware.js';
 import { authRoutes } from './routes/auth.js';
 import { keyRoutes } from './routes/keys.js';
 import { mcpRoutes } from './routes/mcp.js';
+import { serverRoutes } from './routes/servers.js';
 import type { Config } from './config.js';
 import { pingDb, type Db } from './db.js';
 import type { Logger } from './logger.js';
@@ -104,6 +105,15 @@ export async function buildApp({ config, logger, db, metrics }: AppDeps) {
   );
 
   await app.register(keyRoutes({ db, requireAuth: requireAuth as never }));
+
+  await app.register(
+    serverRoutes({
+      db,
+      encryptionKey: config.ENCRYPTION_KEY,
+      requireAuth: requireAuth as never,
+      requireAdmin: requireRole('admin') as never,
+    }),
+  );
 
   // The machine door. A completely separate resolver from the session middleware above:
   // different credential, different lifetime, different revocation story. Sharing one
