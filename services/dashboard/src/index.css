@@ -114,3 +114,128 @@
     animation-iteration-count: 1 !important;
   }
 }
+
+/**
+ * The expandable tool list.
+ *
+ * Gate: a server row is expanded a few times a session while somebody investigates, which
+ * is the "occasional" tier - so it animates. Purpose: **preventing a jarring change**.
+ * Thirteen rows appearing instantly shove everything below them down the page, and the
+ * reader loses their place. Secondary purpose, spatial consistency: the list grows out of
+ * the row that was clicked.
+ *
+ * The mechanism is `grid-template-rows: 0fr -> 1fr`, and that choice is worth defending
+ * because the two obvious options are both worse:
+ *
+ *   - `height: 0 -> auto` does not transition at all. `auto` is not an interpolable value,
+ *     so the content simply snaps.
+ *   - Measuring the content in JavaScript and animating to a pixel height works, but needs
+ *     a ResizeObserver to stay correct - the tool list is loaded asynchronously and grows
+ *     after mount, so a height measured on open would be wrong by the time it mattered.
+ *
+ * Interpolating `fr` units needs neither. The grid resolves the row to its content height
+ * on every frame, including while the content is still arriving.
+ *
+ * It costs layout per frame - the one animation here that does - which is exactly why the
+ * duration is 200ms. A long accordion is expensive as well as sluggish.
+ */
+.expandable {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition:
+    grid-template-rows var(--duration-panel) var(--ease-out),
+    opacity var(--duration-panel) var(--ease-out);
+  opacity: 0;
+}
+
+.expandable[data-open='true'] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
+/* The inner element must clip, or the content is visible at full height while the grid row
+   is still collapsed - the animation plays behind text that is already fully drawn. */
+.expandable > * {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/**
+ * The dialog.
+ *
+ * Modal tier, so 250ms rather than the 200ms used elsewhere, and `transform-origin:
+ * center` - modals are the one popover that stays centred, because they are not anchored
+ * to a trigger.
+ *
+ * `@starting-style` is what makes this work at all. A `<dialog>` in the top layer is
+ * `display: none` until it opens, so there is no previous value to transition from and the
+ * browser would skip straight to the final state. `@starting-style` supplies that previous
+ * value for the first frame after it becomes visible.
+ *
+ * `transition-behavior: allow-discrete` on `display` and `overlay` is the other half: both
+ * are discrete properties, and without this the element leaves the top layer the instant it
+ * closes - so the exit animation plays on something already invisible, which looks like no
+ * exit animation at all.
+ *
+ * Enters from 0.96, never from 0: nothing in the real world appears from nothing.
+ */
+.dialog-panel {
+  margin: auto;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.75rem;
+  background-color: var(--color-ink-900);
+  color: var(--color-ink-100);
+  opacity: 1;
+  transform: scale(1);
+  transform-origin: center;
+  transition:
+    opacity 250ms var(--ease-out),
+    transform 250ms var(--ease-out),
+    display 250ms allow-discrete,
+    overlay 250ms allow-discrete;
+}
+
+.dialog-panel::backdrop {
+  background-color: color-mix(in oklab, var(--color-ink-950) 70%, transparent);
+  opacity: 1;
+  /* The backdrop fades with the panel so the two read as one surface arriving, rather than
+     a dark sheet appearing and then a box growing on top of it. */
+  transition:
+    opacity 250ms var(--ease-out),
+    display 250ms allow-discrete,
+    overlay 250ms allow-discrete;
+}
+
+@starting-style {
+  .dialog-panel[open] {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  .dialog-panel[open]::backdrop {
+    opacity: 0;
+  }
+}
+
+.dialog-panel:not([open]) {
+  opacity: 0;
+  transform: scale(0.96);
+}
+
+.dialog-panel:not([open])::backdrop {
+  opacity: 0;
+}
+
+/**
+ * The login error's entrance. Occasional, and it prevents a jarring change - see the note
+ * in Login.tsx about the reserved slot.
+ */
+@keyframes error-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}

@@ -19,6 +19,7 @@ import type {
   AuditPage,
   AuditSummaryBucket,
   IssuedApiKey,
+  ServerTestResult,
   Session,
   UpstreamServer,
 } from './types.js';
@@ -173,7 +174,74 @@ export const api = {
       const result = await request<{ servers: UpstreamServer[] }>('/api/servers');
       return result.servers;
     },
-    async test(id: string): Promise<{ ok: boolean; reason?: string; tools?: number }> {
+
+    /**
+     * Register an upstream.
+     *
+     * `credential` goes up and never comes back. There is no field for it on
+     * `UpstreamServer` and no endpoint that returns one, so this is the only direction it
+     * can travel - which is what makes "write-only" a property of the system rather than a
+     * convention the UI agrees to follow.
+     */
+    async create(input: {
+      name: string;
+      slug: string;
+      url: string;
+      authType: 'none' | 'bearer' | 'header';
+      authHeader?: string;
+      credential?: string;
+      timeoutMs?: number;
+    }): Promise<UpstreamServer> {
+      const result = await request<{ server: UpstreamServer }>('/api/servers', {
+        method: 'POST',
+        body: input,
+      });
+      return result.server;
+    },
+
+    /**
+     * Change an upstream.
+     *
+     * Partial by design: the gateway validates the RESULTING state rather than the patch,
+     * so sending `{ authType: 'header' }` without a header name is a 400 that names a
+     * field the request never contained. That is correct behaviour and the dialog sends
+     * the whole auth triple together to stay clear of it.
+     *
+     * `slug` is absent on purpose - the gateway refuses to change it, because the slug is
+     * the prefix on every tool name and every audit row already written against it.
+     */
+    async update(
+      id: string,
+      patch: {
+        name?: string;
+        url?: string;
+        authType?: 'none' | 'bearer' | 'header';
+        authHeader?: string | null;
+        credential?: string;
+        enabled?: boolean;
+        timeoutMs?: number;
+      },
+    ): Promise<UpstreamServer> {
+      const result = await request<{ server: UpstreamServer }>(
+        `/api/servers/${encodeURIComponent(id)}`,
+        { method: 'PATCH', body: patch },
+      );
+      return result.server;
+    },
+
+    async remove(id: string): Promise<void> {
+      await request<{ ok: boolean }>(`/api/servers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    },
+
+    /**
+     * Ask the gateway to connect right now.
+     *
+     * Note this returns 200 even when the upstream is unreachable, with the reason in the
+     * body - a deliberate choice from 5.1, because "I tried and it refused the connection"
+     * is a successful test, not a server error. So there is no catch branch here for the
+     * common failure.
+     */
+    async test(id: string): Promise<ServerTestResult> {
       return request(`/api/servers/${encodeURIComponent(id)}/test`, { method: 'POST' });
     },
   },

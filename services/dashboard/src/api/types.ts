@@ -30,6 +30,8 @@ export interface UpstreamServer {
   name: string;
   url: string;
   authType: 'none' | 'bearer' | 'header';
+  /** The header name, when authType is "header". Null otherwise. */
+  authHeader: string | null;
   /**
    * Whether a credential is stored - never the credential itself.
    *
@@ -45,16 +47,65 @@ export interface UpstreamServer {
   lastProbedAt: string | null;
   timeoutMs: number;
   createdAt: string;
+  updatedAt: string;
 }
 
-/** A tool, as the aggregator exposes it. */
+/**
+ * A tool, as the aggregator exposes it.
+ *
+ * The field is `server`, not `serverSlug` - corrected after reading an actual response
+ * rather than the route handler. The first version of this interface invented
+ * `serverSlug`/`serverName`/`upstreamToolName` from the shape of the database row, and the
+ * Servers page grouped every tool under `undefined` as a result: 21 tools, zero shown. That
+ * is the cost of hand-written types, paid on the first screen that used them, and it is why
+ * every field below was checked against a live response.
+ */
 export interface AggregatedTool {
   name: string;
   title?: string;
   description?: string;
-  serverSlug: string;
-  serverName: string;
-  upstreamToolName: string;
+  /** The server's slug. */
+  server: string;
+  /** What the upstream calls this tool, without the prefix. */
+  upstreamName: string;
+  inputSchema: Record<string, unknown>;
+  annotations?: Record<string, unknown>;
+  lastSeenAt: string;
+}
+
+/**
+ * The per-server block `GET /api/tools` returns alongside the tools.
+ *
+ * Worth having typed even though the Servers page derives its counts by grouping: it is the
+ * cheaper source for "how many tools does each server advertise", and 7.3's pages may want
+ * it without loading every tool.
+ */
+export interface ToolsByServer {
+  slug: string;
+  name: string;
+  status: string;
+  lastError: string | null;
+  lastProbedAt: string | null;
+  toolCount: number;
+}
+
+/**
+ * The result of asking the gateway to connect right now.
+ *
+ * `status`, not `ok`. The first version of this type guessed `{ ok: boolean }`, and the
+ * Servers page read `!result.ok` to decide whether to show an error - which was true for
+ * every response, because the field does not exist. So a **successful** test would have
+ * reported a failure toast. Found by calling the endpoint; it could not have been found by
+ * reading the page.
+ */
+export interface ServerTestResult {
+  status: 'connected' | 'unreachable';
+  toolCount: number;
+  /** The upstream's own tool names, on success. */
+  tools?: string[];
+  /** A readable sentence, on failure. */
+  reason?: string;
+  requestId: string;
 }
 
 /** An API key. The secret appears exactly once, in the issue response. */
