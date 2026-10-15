@@ -15,8 +15,9 @@
 import { z } from 'zod';
 import { loadConfig } from './config.js';
 import { createPool } from './db.js';
-import { createLogger } from './logger.js';
+import { createLogger, type Logger } from './logger.js';
 import { hashPassword } from './auth/passwords.js';
+import { matchesAllowlist } from './security/ssrf.js';
 
 /**
  * Seed-only configuration, validated separately from the gateway's.
@@ -32,6 +33,122 @@ const seedSchema = z.object({
   SEED_MEMBER_EMAIL: z.string().min(3).max(320),
   SEED_MEMBER_PASSWORD: z.string().min(12, 'SEED_MEMBER_PASSWORD must be at least 12 characters'),
 });
+
+/**
+ * Upstreams to pre-register, supplied as JSON by the chart.
+ *
+ * A list rather than a single hardcoded WooCommerce entry, because stage 6 adds notes-mcp
+ * and everything-mcp and they belong here for the same reason: an upstream the chart
+ * installs should be registered by the chart, not typed into a form afterwards. Making it
+ * a list now means those two are a values change rather than a code change.
+ */
+const seedUpstreamSchema = z.object({
+  name: z.string().min(1).max(200),
+  slug: z
+    .string()
+    .min(1)
+    .max(60)
+    .regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/, 'slug must be lowercase letters, digits and hyphens'),
+  url: z.string().url().max(2048),
+  // Only 'none' is accepted here, deliberately. A pre-registered upstream with a
+  // credential would mean a secret travelling through this Job's environment to be
+  // encrypted - and the chart has no good place to put one that is not already a
+  // Kubernetes Secret the operator could reference directly. An upstream that needs a
+  // credential is registered through the API, where the write-only path already exists.
+  authType: z.literal('none').default('none'),
+  timeoutMs: z.number().int().min(1000).max(120_000).default(20_000),
+});
+
+/**
+ * Pre-registers the upstreams the chart ships with.
+ *
+ * ON CONFLICT (slug) DO NOTHING, for the same reason the user insert does: this runs on
+ * every `helm upgrade`, and an admin who has since edited the URL, disabled the server or
+ * attached a credential must not have that overwritten by a deploy. Idempotent here means
+ * "leave an existing upstream alone", not "converge it to the declared state" - the
+ * declared state is a starting point, not an authority.
+ *
+ * Deliberately NOT resolving DNS as part of validation, which is a departure from the SSRF
+ * guard on the API. The guard exists because an admin can type an arbitrary URL into a
+ * form; this value comes from Helm values, which is the same file the allowlist itself
+ * comes from - anyone who can change one can change the other, so resolving adds no
+ * security. It would, however, add a failure: the platform chart can be installed before
+ * the store chart, so the name may legitimately not resolve yet, and a seed Job that failed
+ * for that reason would block the whole release.
+ *
+ * The shape and the allowlist ARE checked, because those catch a typo or a misconfigured
+ * URL the gateway could never reach - a cheap check against a real mistake.
+ */
+async function seedUpstreams(db: ReturnType<typeof createPool>, logger: Logger, allowlist: string[]): Promise<void> {
+  const raw = process.env['SEED_UPSTREAMS'];
+  if (raw === undefined || raw.trim() === '' || raw.trim() === '[]') {
+    logger.info('no upstreams to pre-register');
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Fail the Job. A malformed list is a chart error, and failing the hook makes it
+    // visible at deploy time rather than leaving an operator to wonder why their upstream
+    // never appeared.
+    process.stderr.write('seed: SEED_UPSTREAMS is not valid JSON\n');
+    process.exit(1);
+  }
+
+  const upstreams = z.array(seedUpstreamSchema).safeParse(parsed);
+  if (!upstreams.success) {
+    const issues = upstreams.error.issues
+      .map((issue) => `  - ${issue.path.join('.') || '(root)'}: ${issue.message}`)
+      .join('\n');
+    process.stderr.write(`seed: SEED_UPSTREAMS is invalid.\n${issues}\n`);
+    process.exit(1);
+  }
+
+  for (const upstream of upstreams.data) {
+    const host = safeHost(upstream.url);
+    if (host === undefined) {
+      process.stderr.write(`seed: upstream "${upstream.slug}" has an unusable URL\n`);
+      process.exit(1);
+    }
+
+    if (!matchesAllowlist(host, allowlist)) {
+      // Refused rather than warned. Registering a URL the gateway's own guard will reject
+      // on every call would produce an upstream that is permanently unreachable for a
+      // reason nobody would look for in the chart.
+      process.stderr.write(
+        `seed: upstream "${upstream.slug}" host ${host} is not on gateway.upstreamAllowlist; ` +
+          'add it there or remove the upstream from seed.upstreams\n',
+      );
+      process.exit(1);
+    }
+
+    const result = await db.query<{ id: string }>(
+      `INSERT INTO mcp_servers (slug, name, url, auth_type, timeout_ms)
+            VALUES ($1, $2, $3, 'none', $4)
+       ON CONFLICT (slug) DO NOTHING
+         RETURNING id`,
+      [upstream.slug, upstream.name, upstream.url, upstream.timeoutMs],
+    );
+
+    if (result.rows.length === 0) {
+      logger.info({ slug: upstream.slug }, 'upstream already registered, left unchanged');
+    } else {
+      logger.info({ slug: upstream.slug, url: upstream.url }, 'upstream pre-registered');
+    }
+  }
+}
+
+/** The hostname, with IPv6 brackets stripped, or undefined if the URL is unusable. */
+function safeHost(url: string): string | undefined {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+    return host === '' ? undefined : host;
+  } catch {
+    return undefined;
+  }
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -90,6 +207,8 @@ async function main(): Promise<void> {
         logger.info({ email: account.email, role: account.role, userId: result.rows[0]?.id }, 'account created');
       }
     }
+
+    await seedUpstreams(db, logger, config.UPSTREAM_ALLOWLIST);
 
     const counts = await db.query<{ role: string; n: string }>(
       'SELECT role, count(*)::text AS n FROM users GROUP BY role ORDER BY role',

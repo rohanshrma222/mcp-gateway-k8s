@@ -174,6 +174,31 @@ seed:
     tag: dev
   adminEmail: admin@urumi.local
   memberEmail: member@urumi.local
+  # Upstreams registered on first install, so a fresh cluster has the WooCommerce MCP
+  # server already wired in - the brief asks for it pre-registered rather than as a manual
+  # step after deploying.
+  #
+  # ON CONFLICT (slug) DO NOTHING, so this is a STARTING POINT and not an authority: an
+  # admin who later edits the URL, disables the server or attaches a credential keeps those
+  # changes across every `helm upgrade`.
+  #
+  # A list rather than one hardcoded entry because stage 6 adds notes-mcp and
+  # everything-mcp, which belong here for the same reason - an upstream the charts install
+  # should be registered by the charts.
+  #
+  # Every host here must also match gateway.upstreamAllowlist, or the seed Job refuses:
+  # registering a URL the SSRF guard will reject on every call would produce an upstream
+  # that is permanently unreachable for a reason nobody would look for in a values file.
+  #
+  # authType is 'none' only. An upstream needing a credential is registered through the API,
+  # where the write-only encrypted path already exists - putting a secret in this list would
+  # mean it travelling through the seed Job's environment to get there.
+  upstreams:
+    - name: WooCommerce (default store)
+      slug: woo
+      url: http://store-default-woo-mcp.store-default.svc.cluster.local:3000/mcp
+      authType: none
+      timeoutMs: 20000
   backoffLimit: 3
   resources:
     requests: { cpu: 50m, memory: 96Mi }

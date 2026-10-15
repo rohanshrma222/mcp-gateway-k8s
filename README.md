@@ -17,19 +17,40 @@ This is built in stages. The table is the honest state of the repository, not th
 | Stage | Scope | State |
 | --- | --- | --- |
 | 1 | Cluster, repo skeleton, NetworkPolicy proof, chart scaffolding | **done** |
-| 2 | Store: WordPress + WooCommerce + MariaDB, persistent | not started |
-| 3 | WooCommerce MCP server (5 tools, Streamable HTTP) | not started |
-| 4 | Gateway: identity, API keys, upstream registry | not started |
-| 5 | Aggregation and the single `/mcp` endpoint | not started |
+| 2 | Store: WordPress + WooCommerce + MariaDB, persistent | **done** |
+| 3 | WooCommerce MCP server (5 tools, Streamable HTTP) | **done** |
+| 4 | Gateway: identity, API keys, upstream registry | **done** |
+| 5 | Aggregation and the single `/mcp` endpoint | **done** |
 | 6 | Audit log + two more upstreams | not started |
 | 7 | Dashboard | not started |
 | 8 | Chat agent | not started |
 | 9 | Hardening, scale, production story | not started |
 | 10 | Docs, demo, submission | not started |
 
-What works today: `scripts/bootstrap.ps1` builds the cluster and proves the ingress path
-end to end; `scripts/verify-netpol.ps1` proves NetworkPolicy is enforced *and* selective;
+What works today, end to end on a local kind cluster:
+
+- A WooCommerce storefront at `store.urumi.local` you can check out on, with MariaDB and
+  `wp-content` on PVCs that survive pod deletion.
+- A WooCommerce MCP server with five tools, reachable **only** by the gateway - it has no
+  Ingress object at all, and a NetworkPolicy admits only the gateway's pods.
+- A gateway exposing **one** MCP endpoint at `http://app.urumi.local/mcp` that an external
+  client reaches with nothing but a URL and an API key. Tools from every enabled upstream
+  appear under it, namespaced `<server>__<tool>`. The WooCommerce server is pre-registered
+  by the chart, so a fresh install has it without a manual step.
+- Dashboard login with argon2id passwords and role guards, per-user API keys stored as
+  `sha256` and revocable, and upstream credentials encrypted with AES-256-GCM that the API
+  never returns.
+- Two gateway replicas, both serving `/mcp` with the same key, because the endpoint is
+  stateless. Stopping an upstream leaves `tools/list` working and returns a readable error
+  that names the server.
+
+The helper scripts: `scripts/bootstrap.ps1` builds the cluster and proves the ingress path;
+`scripts/verify-netpol.ps1` proves NetworkPolicy is enforced *and* selective;
 `scripts/lint-charts.ps1` lints and renders all three charts against both value overlays.
+
+Not built yet: the audit log and the other two upstreams (stage 6), the React dashboard
+beyond a placeholder (stage 7), the chat agent (stage 8), and tool permissions and rate
+limits (stage 9).
 
 ---
 
@@ -196,16 +217,53 @@ Delivery, then confirm the order in `wp-admin`.
 
 ### Connect an external MCP client — *stage 5*
 
-An admin registers upstream servers in the dashboard. A member is issued an API key, shown
-exactly once. The client then needs nothing but a URL and that key:
+The WooCommerce server is already registered on a fresh install, so the only thing you need
+is a key. Issue one as the seeded admin:
+
+```bash
+# the seeded admin password (generated on first install and kept across upgrades)
+kubectl get secret -n urumi-platform platform-bootstrap   -o jsonpath='{.data.admin-password}' | base64 -d
+
+# sign in, then issue a key - the secret is shown EXACTLY ONCE and only sha256 is stored
+curl -c jar -X POST http://app.urumi.local/api/auth/login   -H 'Content-Type: application/json'   -d '{"email":"admin@urumi.local","password":"<the password above>"}'
+
+curl -b jar -X POST http://app.urumi.local/api/keys   -H 'Content-Type: application/json' -d '{"name":"my laptop"}'
+```
+
+From then on a client needs nothing but a URL and that key - no upstream credential ever
+leaves the cluster:
 
 ```
 URL:    http://app.urumi.local/mcp
 Header: Authorization: Bearer urumi_<keyId>_<secret>
 ```
 
-Every tool from every enabled upstream appears under one endpoint, namespaced
+**Claude Code:**
+
+```bash
+claude mcp add --transport http urumi http://app.urumi.local/mcp   --header "Authorization: Bearer urumi_<keyId>_<secret>"
+```
+
+**MCP Inspector:**
+
+```bash
+npx @modelcontextprotocol/inspector
+# Transport: Streamable HTTP
+# URL:       http://app.urumi.local/mcp
+# Header:    Authorization = Bearer urumi_<keyId>_<secret>
+```
+
+Both need `app.urumi.local` in your hosts file (see *Add the hostnames* above). To check it
+without touching hosts, send the `Host` header yourself:
+
+```bash
+curl -s -X POST http://127.0.0.1/mcp -H 'Host: app.urumi.local'   -H 'Content-Type: application/json'   -H 'Accept: application/json, text/event-stream'   -H "Authorization: Bearer urumi_<keyId>_<secret>"   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+Every tool from every enabled upstream appears under this one endpoint, namespaced
 `<serverSlug>__<toolName>` so two servers exposing `list_products` stay distinguishable.
+A revoked key is refused on the next call, and disabling a server removes its tools from
+`tools/list` *and* refuses a call that names one.
 
 ### Use the chat agent — *stage 8*
 

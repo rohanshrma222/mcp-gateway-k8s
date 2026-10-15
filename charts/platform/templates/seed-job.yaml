@@ -112,6 +112,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "platform.bootstrapSecretName" . }}
                   key: member-email
+            # Passed as JSON so one env var carries a list. toJson rather than a
+            # delimiter-separated string: a tool name or a URL containing the delimiter
+            # would silently split, and JSON is parsed and schema-validated by the seed
+            # script so a malformed list fails the hook at deploy time.
+            - name: SEED_UPSTREAMS
+              value: {{ .Values.seed.upstreams | default list | toJson | quote }}
+            - name: UPSTREAM_ALLOWLIST
+              value: {{ join "," .Values.gateway.upstreamAllowlist | quote }}
             - name: SEED_MEMBER_PASSWORD
               valueFrom:
                 secretKeyRef:

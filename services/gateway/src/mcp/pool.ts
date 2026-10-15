@@ -438,6 +438,34 @@ function describeUpstreamError(error: unknown): string {
   if (error instanceof CredentialError) return error.message;
 
   if (error instanceof Error) {
+    /**
+     * JSON-RPC codes first, because an McpError carries its code as a NUMBER on the error
+     * itself while the switch below reads undici's string `cause.code`. The first version
+     * only had the undici switch, so every McpError fell through to its raw message and a
+     * client saw "MCP error -32001: Request timed out" - the protocol's own wire text, with
+     * a number nobody should have to look up.
+     *
+     * Three raw strings reached a client during stage 5 - "fetch failed", "Connection
+     * closed" and this one - each found only by stopping a real upstream and reading what
+     * came out. The pattern is the lesson: every layer that re-raises someone else's error
+     * needs a default that is readable, not just a happy path that is. These are the
+     * sentences the dashboard, the audit log and an LLM all see.
+     */
+    const rpcCode = (error as { code?: unknown }).code;
+    if (typeof rpcCode === 'number') {
+      switch (rpcCode) {
+        case -32001:
+          // RequestTimeout: the connection was open and the request was delivered, so this
+          // is a slow or wedged upstream rather than an unreachable one. Worth saying,
+          // because the two lead an operator to different places.
+          return 'the upstream accepted the request but did not answer within its timeout';
+        case -32000:
+          return 'the connection closed before the call completed, which usually means the upstream stopped or restarted';
+        default:
+          break;
+      }
+    }
+
     const cause = (error as { cause?: unknown }).cause;
     const code = typeof cause === 'object' && cause !== null && 'code' in cause
       ? String((cause as { code: unknown }).code)
@@ -467,6 +495,24 @@ function describeUpstreamError(error: unknown): string {
      */
     if (error.message === 'fetch failed') {
       return 'the upstream could not be reached: the connection could not be opened';
+    }
+
+    /**
+     * A belt-and-braces fallback for a "connection closed" that arrives without the
+     * numeric code above - a transport-level close raised as a plain Error rather than an
+     * McpError. Kept deliberately: the cost is one regex, and the thing it guards against
+     * is the SDK's wire text reaching a user.
+     *
+     * Translated HERE rather than at the call site, which is the point. The first attempt
+     * put this in mcp/server.ts and it never ran: a pool failure is wrapped in
+     * UpstreamUnavailableError, whose reason the caller forwards verbatim - correctly, by
+     * decision 2.75, because the pool is the component that knows what happened. A
+     * translation added above that wrapper is unreachable for everything the pool handles.
+     * Fixing it here also fixes the prober's persisted reason, the admin test route and the
+     * dashboard's status text, which the call-site version left untouched.
+     */
+    if (/connection closed/i.test(error.message)) {
+      return 'the connection closed before the call completed, which usually means the upstream stopped or restarted';
     }
 
     // Trimmed, because an SDK error message can be long and the dashboard shows this in a
