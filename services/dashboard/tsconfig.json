@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    /**
+     * The base config targets Node (`module: NodeNext`), which is right for the four
+     * services that run under node and wrong here: this code is consumed by Vite, which
+     * resolves like a bundler and handles the module format itself.
+     *
+     * `module: "preserve"` is the pairing TypeScript requires for `moduleResolution:
+     * "bundler"` - overriding only the resolution is an error, which is the compiler
+     * being helpful about a genuinely incoherent combination. Everything else in the base
+     * config, including `verbatimModuleSyntax` and the strict flags that have caught real
+     * bugs in this project, is inherited unchanged.
+     */
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "types": ["vite/client"],
+    "rootDir": "."
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "vite.config.ts"]
+}

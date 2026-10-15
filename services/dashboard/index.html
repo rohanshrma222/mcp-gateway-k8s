@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- No user-scalable=no: preventing zoom breaks the page for anyone who needs it, and
+         the real fix for the iOS zoom-on-focus problem is 16px inputs, which the form
+         uses. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Urumi — MCP gateway</title>
+    <meta name="description" content="Control plane for the Urumi MCP gateway: upstream servers, API keys and the audit log." />
+    <!-- robots: this is an internal control plane. Not a security control - the Ingress and
+         the session cookie are - but there is no reason for it to be indexed if it is ever
+         put on a public hostname. -->
+    <meta name="robots" content="noindex, nofollow" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

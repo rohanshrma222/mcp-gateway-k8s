@@ -1,0 +1,116 @@
+@import 'tailwindcss';
+
+/**
+ * Design tokens.
+ *
+ * Tailwind v4 is configured in CSS rather than a tailwind.config.js, so this file is the
+ * single place a token is defined. Two that can disagree is how a palette drifts.
+ *
+ * The personality is decided here and everything else follows from it: this is an
+ * operations dashboard for someone checking whether their tool servers are healthy. It
+ * should be crisp, quiet and fast. Nothing bounces. A playful component can be bouncier;
+ * a professional dashboard should be legible at 2am.
+ */
+@theme {
+  /* Neutrals carry the whole interface, so they get the most steps. Slate rather than
+     pure grey - a faint blue cast reads as "software" and keeps large surfaces from
+     looking muddy. */
+  --color-ink-50: oklch(0.985 0.002 250);
+  --color-ink-100: oklch(0.967 0.003 250);
+  --color-ink-200: oklch(0.92 0.005 250);
+  --color-ink-300: oklch(0.86 0.008 250);
+  --color-ink-400: oklch(0.68 0.012 250);
+  --color-ink-500: oklch(0.55 0.014 250);
+  --color-ink-600: oklch(0.44 0.016 250);
+  --color-ink-700: oklch(0.35 0.018 252);
+  --color-ink-800: oklch(0.26 0.018 254);
+  --color-ink-900: oklch(0.19 0.016 256);
+  --color-ink-950: oklch(0.14 0.014 258);
+
+  /* One accent, used sparingly. A dashboard with four accent colours has none. */
+  --color-brand-400: oklch(0.72 0.14 248);
+  --color-brand-500: oklch(0.62 0.17 250);
+  --color-brand-600: oklch(0.54 0.18 252);
+  --color-brand-700: oklch(0.46 0.16 254);
+
+  /* Status colours map to the three upstream states the gateway actually reports, so the
+     palette and the domain use the same vocabulary: connected, unreachable, disabled. */
+  --color-ok-500: oklch(0.65 0.16 150);
+  --color-ok-600: oklch(0.55 0.15 152);
+  --color-warn-500: oklch(0.75 0.15 75);
+  --color-warn-600: oklch(0.65 0.15 70);
+  --color-bad-500: oklch(0.62 0.2 25);
+  --color-bad-600: oklch(0.53 0.2 25);
+
+  /**
+   * Custom easing curves, because the CSS built-ins are too weak to read as intentional.
+   *
+   * `--ease-out` is the workhorse: it starts fast, so the interface responds in the
+   * moment the user is watching most closely. There is deliberately NO `ease-in` token
+   * here - ease-in delays the initial movement, which makes a 200ms transition *feel*
+   * slower than ease-out at the same duration. Not offering it is cheaper than
+   * remembering not to use it.
+   */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+
+  /* Durations, named by what they are for rather than by number, so the choice is made
+     once. Everything is under 300ms: a 180ms transition feels more responsive than a
+     400ms one, and this interface has nothing worth waiting for. */
+  --duration-press: 160ms;
+  --duration-tooltip: 125ms;
+  --duration-panel: 200ms;
+}
+
+@layer base {
+  /* `transition: all` is never used anywhere in this codebase. It animates properties
+     nobody chose, including layout ones that cost a reflow per frame. Every transition
+     below names its properties. */
+
+  html {
+    /* Smooth scrolling is removed for the same reason keyboard-driven actions are not
+       animated: it is the browser deciding to be slow on the user's behalf. */
+    scroll-behavior: auto;
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-ink-950);
+    color: var(--color-ink-100);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Focus visible, always, and never removed. A keyboard user has to be able to see where
+     they are, and an operations dashboard will be driven by keyboard by whoever uses it
+     most. */
+  :focus-visible {
+    outline: 2px solid var(--color-brand-400);
+    outline-offset: 2px;
+  }
+
+  /* Tabular figures wherever numbers sit in a column - durations in the audit table, tool
+     counts, timestamps. Proportional digits make a column of numbers jitter as it
+     updates, which on a live table is the difference between readable and distracting. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/**
+ * Reduced motion: fewer and gentler, not zero.
+ *
+ * Opacity and colour transitions survive because they aid comprehension - a row fading in
+ * still reads as "this is new". Movement and scaling go, because those are what cause
+ * motion sickness. Blanket `animation: none` would also strip the former, which is the
+ * common over-correction.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-property: opacity, color, background-color, border-color !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
