@@ -1,73 +1,110 @@
 /**
  * `POST /mcp` - the single endpoint external MCP clients connect to.
  *
- * In this step the **authentication** is complete and real: a Bearer API key is resolved
- * to a principal, revocation and account status are enforced, and the request is logged
- * and attributed. What is NOT here yet is the MCP protocol surface - the client pool,
- * `tools/list` aggregation with prefixed names, and `tools/call` routing - which is stage
- * 5. Until then this endpoint is honest about it rather than pretending.
+ * The brief's definition of done is that Claude Code and MCP Inspector connect with **only
+ * a URL and an API key**: no browser, no cookie, no OAuth dance. That is why this route
+ * shares nothing with the dashboard's session middleware beyond the shape of its result.
  *
- * Mounting the guard now, on the real path, is the point. The resolver is a security
- * boundary, and a security boundary with no route using it is one nobody has tested. This
- * way revocation, disabled accounts and malformed keys are all demonstrable today, against
- * the same URL the brief's definition of done requires an external client to use.
- *
- * Deliberately NOT implemented here: an `initialize` reply. Answering the handshake while
- * having no tools and no `tools/call` would let a client connect successfully and then
- * fail confusingly on first use. Refusing the method outright means a client fails at the
- * handshake with a message naming the reason, which is the more useful failure.
+ * Stateless Streamable HTTP, exactly as woo-mcp is, and for the same reason: a fresh
+ * `Server` and transport per request with no session id, so any replica can answer any
+ * request. No sticky sessions at the ingress, no shared session store, and the replica
+ * count is a number in a values file. The expensive things - the database pool, the
+ * upstream connections, the metrics registry - live in the enclosing closure, so
+ * per-request construction is cheap.
  */
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { FastifyInstance, FastifyPluginOptions } from 'fastify';
 import type { ApiKeyPrincipal } from '../auth/apiKeys.js';
+import type { Db } from '../db.js';
+import type { Logger } from '../logger.js';
+import type { Metrics } from '../metrics.js';
+import { buildGatewayServer } from '../mcp/server.js';
+import type { ClientPool } from '../mcp/pool.js';
 
 export interface McpRouteDeps {
+  db: Db;
+  logger: Logger;
+  metrics: Metrics;
+  pool: ClientPool;
+  encryptionKey: string;
   requireApiKey: (request: never, reply: never) => Promise<void>;
 }
-
-/** JSON-RPC 2.0 reserved code for an unimplemented method. */
-const METHOD_NOT_FOUND = -32601;
 
 export function mcpRoutes(deps: McpRouteDeps) {
   return async function register(
     app: FastifyInstance,
     _opts: FastifyPluginOptions,
   ): Promise<void> {
+    /**
+     * Content type negotiation is handled by Fastify's parser, which is why this route
+     * needs no body-size handling of its own: the app-level `bodyLimit` of 1 MiB already
+     * applies, and a `tools/call` body is a few hundred bytes.
+     */
     app.post('/mcp', { preHandler: deps.requireApiKey as never }, async (request, reply) => {
       const principal = request.apiKeyPrincipal as ApiKeyPrincipal;
 
-      // Attribution is already working: every call through this endpoint is tied to a real
-      // user and a specific key, which is what the audit log in 6.1 will write rows from.
-      // Proving that now means stage 6 is wiring up a value that already exists rather
-      // than inventing one.
-      request.log.info(
-        { userId: principal.userId, keyId: principal.keyId, method: readMethod(request.body) },
-        'authenticated MCP request',
-      );
-
-      return reply.code(501).send({
-        jsonrpc: '2.0',
-        error: {
-          code: METHOD_NOT_FOUND,
-          message:
-            'the gateway MCP endpoint is not serving tools yet: upstream registration is step 4.5 and tool aggregation is stage 5',
-          data: {
-            // Echoed back so a caller can see that authentication succeeded and the
-            // refusal is about capability, not credentials. Without this the 501 is
-            // indistinguishable from a misconfiguration of their key.
-            authenticated: true,
-            user: principal.email,
-            keyId: principal.keyId,
-          },
-        },
-        id: readId(request.body),
+      const { server, records } = buildGatewayServer({
+        db: deps.db,
+        logger: deps.logger,
+        metrics: deps.metrics,
+        pool: deps.pool,
+        encryptionKey: deps.encryptionKey,
+        principal,
+        requestId: String(request.id),
       });
+
+      // sessionIdGenerator is OMITTED rather than set to undefined - the same distinction
+      // as in woo-mcp. The SDK documents both as stateless, but the option is declared
+      // `sessionIdGenerator?: () => string`, and under exactOptionalPropertyTypes passing
+      // an explicit undefined to an optional property is an error. Omitting it is the same
+      // behaviour and type-clean.
+      const transport = new StreamableHTTPServerTransport({});
+
+      /**
+       * Closed when the response ends, including when a client disconnects mid-stream.
+       *
+       * Without this every request leaks a transport and its listeners - invisible at
+       * first, then an out-of-memory restart under real traffic. The audit rows that 6.1
+       * will write are collected in `records` by then, so closing here loses nothing.
+       */
+      reply.raw.on('close', () => {
+        void transport.close();
+        void server.close();
+
+        // Logged at debug so a call that produced no record - a malformed envelope, a
+        // method we do not implement - is still visible when looking for one.
+        if (records.length === 0) {
+          deps.logger.debug(
+            { requestId: request.id, userId: principal.userId },
+            'mcp request produced no tool-call records',
+          );
+        }
+      });
+
+      // Cast at the SDK boundary. `StreamableHTTPServerTransport` declares
+      // `onclose?: (() => void) | undefined` while the `Transport` interface declares
+      // `onclose?: () => void`, so under exactOptionalPropertyTypes the SDK's own class
+      // does not satisfy the SDK's own interface. Relaxing the flag for this service would
+      // be the easy fix and would also stop it catching the mistakes it has caught here.
+      await server.connect(transport as unknown as Transport);
+
+      // Fastify has already parsed the body; handing it over avoids the transport trying
+      // to read a stream that is finished, which would hang until the request timeout.
+      await transport.handleRequest(request.raw, reply.raw, request.body);
+
+      // Tells Fastify the response is being written directly to the raw socket, so it does
+      // not try to send its own. Without it Fastify waits for a return value and the
+      // request eventually times out despite the transport having answered.
+      return reply;
     });
 
-    // GET and DELETE on /mcp are what a Streamable HTTP client uses to resume a stream or
-    // end a session. The gateway's MCP server will be stateless, for the same reason
-    // woo-mcp's is - any replica must be able to answer any request, with no sticky
-    // sessions and no shared session store - so these stay genuinely unsupported rather
-    // than unimplemented. 405 with `Allow` says which it is.
+    /**
+     * GET and DELETE are what a Streamable HTTP client uses to resume a stream or end a
+     * session. This server is stateless - any replica answers any request - so there is no
+     * stream to resume and no session to delete. They are genuinely unsupported rather
+     * than unimplemented, and 405 with `Allow` says which.
+     */
     for (const method of ['get', 'delete'] as const) {
       app[method]('/mcp', { preHandler: deps.requireApiKey as never }, async (_request, reply) =>
         reply.code(405).header('allow', 'POST').send({
@@ -76,28 +113,4 @@ export function mcpRoutes(deps: McpRouteDeps) {
       );
     }
   };
-}
-
-/**
- * Reads `method` and `id` from an untrusted body without assuming it is an object.
- *
- * The body is whatever the caller sent - it may be a string, null, or an array. Indexing
- * into it blindly is how a log line becomes a 500, so these narrow first and fall back to
- * a placeholder. `id: null` is the correct JSON-RPC value when the request's id could not
- * be determined.
- */
-function readMethod(body: unknown): string {
-  if (typeof body === 'object' && body !== null && 'method' in body) {
-    const { method } = body as { method: unknown };
-    if (typeof method === 'string') return method;
-  }
-  return '(unknown)';
-}
-
-function readId(body: unknown): string | number | null {
-  if (typeof body === 'object' && body !== null && 'id' in body) {
-    const { id } = body as { id: unknown };
-    if (typeof id === 'string' || typeof id === 'number') return id;
-  }
-  return null;
 }

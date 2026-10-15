@@ -129,7 +129,16 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
   // resolver would be one `if` away from letting a session cookie authenticate a tool
   // call, or a long-lived API key drive the dashboard admin routes.
   const requireApiKey = makeRequireApiKey({ db });
-  await app.register(mcpRoutes({ requireApiKey: requireApiKey as never }));
+  await app.register(
+    mcpRoutes({
+      db,
+      logger,
+      metrics,
+      pool,
+      encryptionKey: config.ENCRYPTION_KEY,
+      requireApiKey: requireApiKey as never,
+    }),
+  );
 
   // Echo the request id back on every response, including errors. Without this, a user
   // reporting "it failed" has nothing to correlate against the logs, and the id is only
