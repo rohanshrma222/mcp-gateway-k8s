@@ -1,0 +1,87 @@
+{{- if .Values.notesMcp.enabled }}
+{{- $ctx := dict "root" $ "component" "notes-mcp" "spec" .Values.notesMcp }}
+{{/*
+Step 6.3 - the second upstream we wrote ourselves.
+
+Lives in charts/upstreams rather than charts/store because it belongs to no store: it is a
+team-wide notes server. woo-mcp is the opposite - one per store, so it ships inside that
+store's release. The split is what makes "install a second store" a second `helm install`
+without duplicating this.
+
+Like woo-mcp, this chart creates NO Ingress. "Unreachable from outside the cluster" is a
+property of an object that does not exist rather than a rule someone has to maintain, and
+the NetworkPolicy then closes the in-cluster path on top of that.
+
+replicas is 1 and cannot usefully be more. SQLite on a ReadWriteOnce volume means one
+writer on one node, and a second replica would either fail to schedule or - worse, on a
+ReadWriteMany backend - corrupt the database. That is a real constraint rather than an
+oversight, and it is independently useful for the demo: an upstream that genuinely cannot
+scale horizontally, sitting behind a gateway that can.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "upstreams.notesMcp.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ .Values.notesMcp.replicas }}
+  # Recreate, NOT RollingUpdate - the one place this differs from woo-mcp's deployment.
+  #
+  # A rolling update starts the new pod before terminating the old one, and both would
+  # want the same ReadWriteOnce volume. On a single-node kind cluster that appears to work
+  # and gives two processes a writable handle on one SQLite file; on a real cluster the new
+  # pod simply never schedules and the rollout hangs until it times out. Recreate accepts a
+  # few seconds of downtime, which for this upstream means the gateway reports it
+  # unreachable with a clear reason and keeps serving every other server's tools.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: notes-mcp
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            # On the PVC, deliberately. The root filesystem is read-only, so a path
+            # anywhere else fails at startup instead of quietly writing notes somewhere
+            # that vanishes on the next rollout.
+            - name: NOTES_DB_PATH
+              value: /data/notes.db
+            - name: NOTES_SLUG
+              value: {{ .Values.notesMcp.slug | quote }}
+            - name: PORT
+              value: {{ (first .Values.notesMcp.ports).containerPort | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.notesMcp.logLevel | quote }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # node:sqlite writes its WAL and shared-memory files next to the database, so
+            # those land on the PVC - but a temp store spill goes to the OS temp
+            # directory, which the read-only root filesystem forbids. An emptyDir names
+            # exactly what is writable instead of opening the whole filesystem, the same
+            # pattern the Postgres and nginx workloads use.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          {{- if .Values.notesMcp.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "upstreams.notesMcp.name" . }}-data
+          {{- else }}
+          # Only for a throwaway install. Notes do not survive a restart without the PVC,
+          # which is why persistence.enabled defaults to true rather than being opt-in.
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

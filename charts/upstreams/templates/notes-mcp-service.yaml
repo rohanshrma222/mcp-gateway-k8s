@@ -1,0 +1,23 @@
+{{- if .Values.notesMcp.enabled }}
+{{/*
+ClusterIP, and that is the only address notes-mcp has. No Ingress, no NodePort, no
+LoadBalancer - a name that resolves inside the cluster and nowhere else.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "upstreams.notesMcp.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "notes-mcp") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    {{- range .Values.notesMcp.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "notes-mcp") | nindent 4 }}
+{{- end }}

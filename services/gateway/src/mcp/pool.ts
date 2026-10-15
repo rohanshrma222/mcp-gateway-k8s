@@ -455,10 +455,20 @@ function describeUpstreamError(error: unknown): string {
     if (typeof rpcCode === 'number') {
       switch (rpcCode) {
         case -32001:
-          // RequestTimeout: the connection was open and the request was delivered, so this
-          // is a slow or wedged upstream rather than an unreachable one. Worth saying,
-          // because the two lead an operator to different places.
-          return 'the upstream accepted the request but did not answer within its timeout';
+          /**
+           * RequestTimeout: the request did not complete inside its budget.
+           *
+           * The first wording said "the upstream accepted the request but did not answer",
+           * on the assumption that -32001 implies an established connection. It does not,
+           * and testing against a Service with zero endpoints proved it: the TCP connect
+           * simply hung, the request timeout fired first, and a client was told an
+           * upstream had accepted a request when nothing was listening at all.
+           *
+           * So this says only what the code actually evidences. Guessing at a cause from
+           * an error code is the same mistake as reading one out of another component's
+           * prose - decision 2.75 - and this time I made it in the fix for that.
+           */
+          return 'the request did not complete within the timeout';
         case -32000:
           return 'the connection closed before the call completed, which usually means the upstream stopped or restarted';
         default:

@@ -18,7 +18,14 @@ notesMcp:
   image:
     repository: urumi/notes-mcp
     tag: dev
+  # 1, and it cannot usefully be more: SQLite on a ReadWriteOnce volume means one writer
+  # on one node. A second replica either fails to schedule or, on a ReadWriteMany backend,
+  # corrupts the database. A real constraint rather than an oversight - and a useful one
+  # for the demo, since it puts an upstream that genuinely cannot scale behind a gateway
+  # that can.
   replicas: 1
+  slug: team
+  logLevel: info
   # Exposes add_note, list_notes - and list_products, which collides with the
   # WooCommerce server's tool of the same name on purpose. A collision that exists only
   # in a design document is not a demonstration; this one makes the
@@ -37,6 +44,28 @@ notesMcp:
   securityContext:
     runAsUser: 1000
     runAsGroup: 1000
+    # fsGroup declares which group should own the mounted volume, so a non-root process can
+    # write to it. Declared here for portability - and the honest version of what it does
+    # on this cluster is worth writing down, because it is less than it looks.
+    #
+    # Measured rather than assumed. With fsGroup: 1000 set, `stat /data` inside the pod
+    # still reports root:root mode 0777. The PV is hostPath-backed (the local-path
+    # provisioner, which is also k3s's default), and the kubelet does not apply fsGroup
+    # ownership to a hostPath volume. So on both the kind cluster AND the k3s VPS target,
+    # this pod can write only because the provisioner happens to create the directory
+    # world-writable.
+    #
+    # It is still correct to declare it, for the case this project is explicitly asked to
+    # support: swapping the storage backend in values-prod.yaml. A CSI driver - a cloud
+    # disk, Longhorn - does honour fsGroup, and without this line the pod would get a
+    # root-owned 0755 directory it cannot write, crash-looping with an error about SQLite
+    # rather than about permissions. Postgres sets fsGroup: 70 for the same reason; this
+    # was the inconsistency.
+    #
+    # What this is NOT is a fix for the 0777 reliance on local-path. That is a property of
+    # the provisioner, not something a pod spec can assert, and claiming otherwise would be
+    # a sentence in a values file that a reviewer could disprove with one `stat`.
+    fsGroup: 1000
     # Writes a SQLite file to its PVC, and nowhere else.
     readOnlyRootFilesystem: true
   persistence:

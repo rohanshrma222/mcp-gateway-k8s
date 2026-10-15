@@ -1,0 +1,99 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $ctx := dict "root" $ "component" "notes-mcp" }}
+{{/*
+Step 6.3 - the same isolation woo-mcp has, in a second namespace.
+
+Three objects, for the same reasons set out at length in charts/store's
+woo-mcp-networkpolicy.yaml:
+
+  1. default-deny      nothing in this namespace accepts traffic unless a policy allows it
+  2. allow-gateway     notes-mcp accepts traffic ONLY from pods labelled as the gateway
+  3. egress            notes-mcp may reach DNS, and nothing else
+
+The third one is where this differs, and it is stricter than woo-mcp's. woo-mcp needs
+egress to WordPress because its whole job is calling the store. notes-mcp owns its
+storage, so it has no legitimate outbound destination at all beyond DNS - and DNS only
+because the Node runtime resolves names during startup. An upstream that cannot make an
+outbound connection cannot be turned into an exfiltration path or a port scanner by a
+prompt-injected tool call, which is the concrete version of the threat the stand-out
+security work is about.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "common.fullname" . }}-default-deny
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "netpol") | nindent 4 }}
+spec:
+  # Empty podSelector means every pod in this namespace. Ingress only here; egress is
+  # declared per component below, where the allowed destinations are actually known.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+{{- if .Values.notesMcp.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "upstreams.notesMcp.name" . }}-allow-gateway
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # namespaceSelector and podSelector inside ONE `from` entry are an AND: traffic
+        # must come from a pod carrying the gateway's labels AND in the platform
+        # namespace. As two separate list entries they would be an OR - "any pod with
+        # these labels anywhere, or any pod at all in that namespace" - which is a common
+        # mistake and silently far weaker than it looks.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.gatewayNamespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayPodLabels | nindent 14 }}
+      ports:
+        {{- range .Values.notesMcp.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .name }}
+        {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "upstreams.notesMcp.name" . }}-egress
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS only. Declaring Egress at all makes everything not listed here denied, so this
+    # is the complete list of places this pod may send a packet.
+    #
+    # Both protocols: a reply larger than 512 bytes sets the truncated bit and the
+    # resolver retries over TCP. A UDP-only rule works until the day it does not, and the
+    # symptom is an intermittent resolution failure under load, which is a genuinely
+    # unpleasant thing to debug.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+{{- end }}
+{{- end }}

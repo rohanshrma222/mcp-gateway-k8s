@@ -199,6 +199,18 @@ seed:
       url: http://store-default-woo-mcp.store-default.svc.cluster.local:3000/mcp
       authType: none
       timeoutMs: 20000
+    # Step 6.3. This entry is the whole cost of adding an upstream the charts install -
+    # no gateway code changed, which is what the list in 5.5 was for.
+    #
+    # It exposes list_products, exactly as the WooCommerce server does. That collision is
+    # deliberate: the gateway advertises them as notes__list_products and
+    # woo__list_products, and they return genuinely different answers - what the team has
+    # written about versus what is actually in the shop.
+    - name: Team notes
+      slug: notes
+      url: http://upstreams-notes-mcp.mcp-upstreams.svc.cluster.local:3000/mcp
+      authType: none
+      timeoutMs: 10000
   backoffLimit: 3
   resources:
     requests: { cpu: 50m, memory: 96Mi }

@@ -439,13 +439,18 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
       }
 
       /**
-       * A RequestTimeout from the SDK is the genuine article: the connection was
-       * established, the request was sent, and the upstream did not answer inside the
-       * budget. That is the only case where quoting the configured timeout is truthful.
+       * A RequestTimeout from the SDK: the request outlived its budget. That is the only
+       * case where quoting the configured timeout is truthful - the duration really is the
+       * one that elapsed.
+       *
+       * It does NOT establish that the upstream received anything. An earlier version said
+       * "accepted the request but did not respond", and a Service with zero endpoints
+       * disproved it: the connect hung, this timeout fired first, and the message asserted
+       * a handshake that never happened. The wording now claims only the timeout.
        */
       if (isRequestTimeout(error)) {
         return fail(
-          `the server "${tool.serverSlug}" accepted the request but did not respond within ${loaded.target.timeoutMs}ms`,
+          `the server "${tool.serverSlug}" did not respond within its ${loaded.target.timeoutMs}ms timeout`,
           'timeout',
           'upstream_timeout',
           { slug: tool.serverSlug, id: tool.serverId },
@@ -522,10 +527,12 @@ function describeResultError(result: unknown): string {
  * and keeps the pool's own wording, because the pool is the component that knows which it
  * was.
  *
- * `timeout` is its own audit outcome for exactly this reason: "accepted the request but did
- * not respond" tells an operator the upstream is overloaded, while "could not be reached"
- * tells them it is down. Those lead to different actions, so conflating them loses
- * information the audit log exists to keep.
+ * `timeout` remains its own audit outcome, but for a narrower and more defensible reason
+ * than the one first written here. It does not mean "the upstream is overloaded" - a
+ * timeout cannot distinguish a slow server from a connect that never completed. It means
+ * "we gave up waiting", as opposed to "the transport told us it had failed", and those are
+ * genuinely different events: one is bounded by our own configuration and the other is
+ * not.
  */
 function isRequestTimeout(error: unknown): boolean {
   return (

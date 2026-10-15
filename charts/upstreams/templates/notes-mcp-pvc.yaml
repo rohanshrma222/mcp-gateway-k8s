@@ -1,0 +1,38 @@
+{{- if and .Values.notesMcp.enabled .Values.notesMcp.persistence.enabled }}
+{{/*
+The notes database.
+
+A standalone PVC rather than a StatefulSet's volumeClaimTemplate, because this is a
+Deployment: there is exactly one of it and it has no need of a stable ordinal identity or
+a per-replica volume. The StatefulSets in this project (MariaDB, Postgres) earn that shape
+because a second replica would need its own volume; this one cannot have a second replica
+at all.
+
+ReadWriteOnce is what SQLite requires and also what every local provisioner offers. It is
+the reason the Deployment uses the Recreate strategy - see notes-mcp-deployment.yaml.
+
+A PVC is deliberately NOT deleted by `helm uninstall` when it was created this way, which
+is the behaviour you want for data: removing the release should not silently destroy the
+team's notes. Reclaiming the space is then an explicit `kubectl delete pvc`.
+*/}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "upstreams.notesMcp.name" . }}-data
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "notes-mcp") | nindent 4 }}
+  annotations:
+    # Survives `helm uninstall`. Without this Helm deletes the claim with the release and
+    # the underlying volume goes with it, which turns an uninstall into data loss.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  {{- $class := .Values.notesMcp.persistence.storageClass | default .Values.global.storageClass }}
+  {{- if $class }}
+  storageClassName: {{ $class | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.notesMcp.persistence.size | quote }}
+{{- end }}
