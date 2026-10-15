@@ -20,6 +20,7 @@ import { keyRoutes } from './routes/keys.js';
 import { mcpRoutes } from './routes/mcp.js';
 import { serverRoutes } from './routes/servers.js';
 import { toolRoutes } from './routes/tools.js';
+import { auditRoutes } from './routes/audit.js';
 import type { Config } from './config.js';
 import { pingDb, type Db } from './db.js';
 import type { Logger } from './logger.js';
@@ -123,6 +124,7 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
   );
 
   await app.register(toolRoutes({ db, requireAuth: requireAuth as never }));
+  await app.register(auditRoutes({ db, requireAuth: requireAuth as never }));
 
   // The machine door. A completely separate resolver from the session middleware above:
   // different credential, different lifetime, different revocation story. Sharing one

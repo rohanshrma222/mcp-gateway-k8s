@@ -1,0 +1,45 @@
+-- 006  The composite index the audit query's keyset pagination actually orders by.
+--
+-- 003 created `audit_log (started_at DESC)`, which was the right index for the query shape
+-- that existed when it was written: "newest first, optionally filtered". 6.2's query API
+-- orders by `started_at DESC, id DESC` instead, because `started_at` is not unique - two
+-- calls can share a millisecond - and a cursor on the timestamp alone would either skip or
+-- repeat the ties.
+--
+-- Measured rather than assumed, on a 300,000-row scratch copy of this table with the same
+-- indexes, since the real table is too small for the planner to reveal anything:
+--
+--   with (started_at DESC) only:
+--     Limit -> Incremental Sort (Presorted Key: started_at)
+--                -> Index Scan using audit_log_started_at_idx
+--
+--   with this index:
+--     Limit -> Index Only Scan using audit_log_keyset_idx
+--                Index Cond: (ROW(started_at, id) < ROW($1, $2))
+--
+-- The sort disappears entirely and the heap is not touched at all: the index covers both
+-- the predicate and the ordering, which is the whole point of matching the index to the
+-- ORDER BY. The Incremental Sort version is not broken - it reads one page and sorts the
+-- ties within it - but it does more work per page forever, on the table that grows fastest.
+--
+-- The same test is what quantified the choice of keyset over OFFSET. At a depth of 100,000
+-- rows, returning 51:
+--
+--   OFFSET 100000  ->  Heap Fetches: 100051, Buffers: shared hit=1209 read=383
+--   keyset cursor  ->  Buffers: shared hit=1 read=2
+--
+-- 1,592 buffers against 3, for the same 51 rows. That is in the migration rather than only
+-- in a commit message because it is the number that justifies the cursor in the API, and
+-- the API's shape is why this index exists.
+--
+-- DESC on both columns to match the ORDER BY exactly. Postgres can scan an ascending index
+-- backwards, so a plain (started_at, id) would also work here; declaring the directions
+-- that the query actually uses means the plan does not depend on that capability, and it
+-- costs nothing.
+CREATE INDEX audit_log_keyset_idx ON audit_log (started_at DESC, id DESC);
+
+-- `audit_log_started_at_idx` from 003 is deliberately left in place. It is the prefix of
+-- this one, so a planner that wants only `started_at` can use either, and dropping an index
+-- inside a migration that runs against a live table is a bigger claim than this step needs
+-- to make. 9.4's least-privilege sweep is the right place to revisit whether it earns its
+-- write cost.
