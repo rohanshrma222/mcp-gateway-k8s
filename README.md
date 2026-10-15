@@ -21,7 +21,7 @@ This is built in stages. The table is the honest state of the repository, not th
 | 3 | WooCommerce MCP server (5 tools, Streamable HTTP) | **done** |
 | 4 | Gateway: identity, API keys, upstream registry | **done** |
 | 5 | Aggregation and the single `/mcp` endpoint | **done** |
-| 6 | Audit log + two more upstreams | not started |
+| 6 | Audit log + two more upstreams | **in progress** (5 of 6) |
 | 7 | Dashboard | not started |
 | 8 | Chat agent | not started |
 | 9 | Hardening, scale, production story | not started |
@@ -40,6 +40,11 @@ What works today, end to end on a local kind cluster:
 - Dashboard login with argon2id passwords and role guards, per-user API keys stored as
   `sha256` and revocable, and upstream credentials encrypted with AES-256-GCM that the API
   never returns.
+- **Three** upstream MCP servers behind one endpoint, 21 tools in total: the WooCommerce
+  server, a team notes server (ours, exposing `list_products` on purpose so it *collides*
+  with the shop one and the `<server>__<tool>` naming can be shown working), and the
+  third-party reference "everything" server, vendored as a pinned dependency rather than
+  pulled as an image. None has an Ingress; all three are reachable only from the gateway.
 - Two gateway replicas, both serving `/mcp` with the same key, because the endpoint is
   stateless. Stopping an upstream leaves `tools/list` working and returns a readable error
   that names the server.
@@ -48,9 +53,10 @@ The helper scripts: `scripts/bootstrap.ps1` builds the cluster and proves the in
 `scripts/verify-netpol.ps1` proves NetworkPolicy is enforced *and* selective;
 `scripts/lint-charts.ps1` lints and renders all three charts against both value overlays.
 
-Not built yet: the audit log and the other two upstreams (stage 6), the React dashboard
+Not built yet: the React dashboard
 beyond a placeholder (stage 7), the chat agent (stage 8), and tool permissions and rate
-limits (stage 9).
+limits (stage 9). The audit log and its query API are done (stage 6); what remains there is
+Prometheus coverage of the new upstreams.
 
 ---
 
@@ -171,15 +177,44 @@ gateway gets through".
 
 ### 4. Deploy the application
 
-*Stage 2 onward. This section fills in as the charts gain templates.*
+```powershell
+.\scripts\deploy-local.ps1
+```
+
+Builds all five images, loads them into the kind cluster, and installs the three charts in
+dependency order. Idempotent - safe to re-run after any change. Pass `-SkipImages` when only
+chart values changed.
+
+It exists rather than being a list of commands here for a reason worth stating: the
+`mcp-upstreams` namespace used to exist only because somebody had created it by hand, so
+every chart was correct and a fresh clone still could not deploy. The end-to-end path was
+never the thing being run, so it rotted unnoticed. This script *is* that path.
+
+The equivalent by hand, if you would rather see it:
 
 ```powershell
-# planned
-helm dependency build charts/store
-helm upgrade --install store-default charts/store `
-  --namespace store-default --create-namespace `
-  --values charts/store/values-local.yaml
+# Order matters: the platform chart pre-registers every upstream above it.
+foreach ($r in @(
+  @{ n='store-default'; c='charts/store';     ns='store-default'  },
+  @{ n='upstreams';     c='charts/upstreams'; ns='mcp-upstreams'  },
+  @{ n='platform';      c='charts/platform';  ns='urumi-platform' }
+)) {
+  helm dependency build $r.c
+  helm upgrade --install $r.n $r.c --namespace $r.ns --create-namespace `
+    --values "$($r.c)/values-local.yaml" --wait --timeout 10m
+}
 ```
+
+Then prove the isolation requirement holds:
+
+```powershell
+.\scripts\verify-upstream-isolation.ps1
+```
+
+Five phases, exit 0 only if all pass: no Ingress references any MCP server; the gateway can
+reach all three; an unlabelled pod in an unrelated namespace can reach none of them; our two
+own upstreams can reach nothing but DNS; and the upstreams cannot reach each other. Each
+negative has a control check beside it, so "blocked" can never be confused with "broken".
 
 ---
 
@@ -329,6 +364,11 @@ kubectl config use-context kind-urumi
 kubectl get tigerastatus
 kubectl get --raw=/readyz
 kind delete cluster --name urumi
+
+# deploy and prove
+.\scripts\deploy-local.ps1                 # build images, install all three charts
+.\scripts\deploy-local.ps1 -SkipImages     # charts only
+.\scripts\verify-upstream-isolation.ps1    # prove every upstream is gateway-only
 
 # charts
 helm dependency build charts/store
