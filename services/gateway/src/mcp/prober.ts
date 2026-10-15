@@ -19,6 +19,7 @@ import type { Logger } from '../logger.js';
 import type { Metrics } from '../metrics.js';
 import { forgetUpstream } from '../metrics.js';
 import { ClientPool, UpstreamUnavailableError } from './pool.js';
+import { buildToolName } from './naming.js';
 import { CredentialError, loadUpstream, type UpstreamTarget } from './upstreams.js';
 
 export interface ProberOptions {
@@ -40,25 +41,6 @@ export interface ProberOptions {
   probeTimeoutMs: number;
 }
 
-/**
- * The separator between an upstream's slug and its tool name.
- *
- * Double underscore because a single one appears inside tool names constantly
- * (`list_products`), so a single-underscore separator would be ambiguous to split on. The
- * slug pattern forbids underscores entirely, which is what makes the first `__` the
- * unambiguous boundary.
- *
- * NOTE: this is the simple form. The 60-character clamp with a hash suffix, and the
- * collision handling for two upstreams exposing the same tool name, are step 5.3. The
- * column is NOT NULL and UNIQUE, so something has to be written now; writing the plain
- * form and tightening it next is honest, and 5.3 changes one function rather than adding
- * a column.
- */
-export const PREFIX_SEPARATOR = '__';
-
-export function prefixedName(slug: string, toolName: string): string {
-  return `${slug}${PREFIX_SEPARATOR}${toolName}`;
-}
 
 export class HealthProber {
   private timer?: NodeJS.Timeout;
@@ -307,32 +289,35 @@ export class HealthProber {
     const probedAt = new Date();
 
     for (const tool of tools) {
-      await this.options.db.query(
-        `INSERT INTO mcp_tools
-           (server_id, name, prefixed_name, title, description, input_schema, annotations, last_seen_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (server_id, name) DO UPDATE
-            SET prefixed_name = EXCLUDED.prefixed_name,
-                title         = EXCLUDED.title,
-                description   = EXCLUDED.description,
-                input_schema  = EXCLUDED.input_schema,
-                annotations   = EXCLUDED.annotations,
-                last_seen_at  = EXCLUDED.last_seen_at`,
-        [
-          target.id,
-          tool.name,
-          prefixedName(target.slug, tool.name),
-          tool.title ?? null,
-          tool.description ?? null,
-          // Stringified for jsonb. The schema and annotations are stored verbatim because
-          // 5.4 forwards them to clients: rewriting them here would mean a client sees a
-          // schema the upstream never published, and an argument that validates at the
-          // gateway and fails upstream.
-          JSON.stringify(tool.inputSchema ?? {}),
-          JSON.stringify(tool.annotations ?? {}),
-          probedAt,
-        ],
-      );
+      try {
+        await this.upsertTool(target, tool, probedAt);
+      } catch (error) {
+        /**
+         * A unique violation here means two tools clamped to the same exposed name.
+         *
+         * `prefixed_name` is UNIQUE, and the clamp appends 48 bits of digest, so this is
+         * about a one-in-ten-thousand event across 200,000 long names - and far less at
+         * this project's scale. It is handled anyway, because the consequence of NOT
+         * handling it is the worst kind: the second tool's insert fails, that tool stops
+         * being advertised, and nothing says why.
+         *
+         * Logged at error with both names, skipping just this tool. The alternative -
+         * letting it propagate - would abandon the rest of the upstream's refresh, so one
+         * pathological tool name would take out an entire server's tool list.
+         */
+        if (isUniqueViolation(error)) {
+          this.options.logger.error(
+            {
+              slug: target.slug,
+              tool: tool.name,
+              exposedName: buildToolName(target.slug, tool.name),
+            },
+            'tool name collides with an existing exposed name after clamping; this tool is not advertised',
+          );
+          continue;
+        }
+        throw error;
+      }
     }
 
     /**
@@ -346,6 +331,46 @@ export class HealthProber {
     await this.options.db.query(
       'DELETE FROM mcp_tools WHERE server_id = $1 AND last_seen_at < $2',
       [target.id, probedAt],
+    );
+  }
+
+  /** One tool's upsert, extracted so the collision handling above stays readable. */
+  private async upsertTool(
+    target: UpstreamTarget,
+    tool: {
+      name: string;
+      title?: string | undefined;
+      description?: string | undefined;
+      inputSchema?: unknown;
+      annotations?: unknown;
+    },
+    probedAt: Date,
+  ): Promise<void> {
+    await this.options.db.query(
+        `INSERT INTO mcp_tools
+           (server_id, name, prefixed_name, title, description, input_schema, annotations, last_seen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (server_id, name) DO UPDATE
+            SET prefixed_name = EXCLUDED.prefixed_name,
+                title         = EXCLUDED.title,
+                description   = EXCLUDED.description,
+                input_schema  = EXCLUDED.input_schema,
+                annotations   = EXCLUDED.annotations,
+                last_seen_at  = EXCLUDED.last_seen_at`,
+        [
+          target.id,
+          tool.name,
+          buildToolName(target.slug, tool.name),
+          tool.title ?? null,
+          tool.description ?? null,
+          // Stringified for jsonb. The schema and annotations are stored verbatim because
+          // 5.4 forwards them to clients: rewriting them here would mean a client sees a
+          // schema the upstream never published, and an argument that validates at the
+          // gateway and fails upstream.
+          JSON.stringify(tool.inputSchema ?? {}),
+          JSON.stringify(tool.annotations ?? {}),
+          probedAt,
+        ],
     );
   }
 
@@ -400,4 +425,14 @@ export class HealthProber {
       }
     }
   }
+}
+
+/** Postgres unique_violation. Narrowed rather than cast, since the error is unknown. */
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error as { code: unknown }).code === '23505'
+  );
 }
