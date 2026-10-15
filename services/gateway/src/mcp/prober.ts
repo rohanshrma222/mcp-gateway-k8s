@@ -89,6 +89,17 @@ export class HealthProber {
       // added.
       await Promise.allSettled(targets.map((target) => this.probe(target)));
       await this.reconcileRemoved(targets);
+      /**
+       * Stamped at the END of a successful pass, and deliberately not in the `finally`
+       * below.
+       *
+       * The point of this gauge is to make a wedged or dead prober visible, so it must
+       * only advance when a pass actually completed. Putting it in `finally` would
+       * refresh it even when the cycle threw - which would report freshness precisely
+       * when there is none, and an alert built on it would go quiet at the moment it
+       * mattered.
+       */
+      this.options.metrics.probeCycleCompleted.set(Date.now() / 1000);
     } catch (error) {
       // A cycle failing as a whole means the database read failed - the probes themselves
       // handle their own errors. Logged and swallowed, because throwing from a timer
@@ -210,6 +221,24 @@ export class HealthProber {
     // than the uuid, because a uuid on a graph axis is unreadable and the slug is already
     // bounded and unique.
     this.options.metrics.upstreamUp.set({ server: slug }, status === 'connected' ? 1 : 0);
+
+    /**
+     * The tool count, set only when this pass actually learned it.
+     *
+     * `toolCount` is undefined when the probe failed, and the gauge is deliberately left
+     * alone in that case rather than set to 0. Setting 0 would say "this upstream now
+     * advertises no tools", which is false and contradicts the design decision from 5.2:
+     * a failed probe KEEPS the cached tools, so `tools/list` keeps working through an
+     * outage. A gauge that said 0 while the cache still served five tools would make the
+     * metrics disagree with the behaviour, and the metrics would be the wrong one.
+     *
+     * `mcp_upstream_up` already carries "is it reachable". This carries "how much is it
+     * offering", and the two are independent: an upstream can be up and have silently
+     * stopped advertising half its tools, which is invisible from the health gauge alone.
+     */
+    if (toolCount !== undefined) {
+      this.options.metrics.upstreamTools.set({ server: slug }, toolCount);
+    }
 
     // Only logged on a *change*, which is the difference between a useful log and 5,760
     // lines a day saying nothing happened. The pool already logs the transition into

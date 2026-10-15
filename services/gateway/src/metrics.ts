@@ -7,6 +7,8 @@
  *   mcp_tool_call_duration_seconds{server,tool} which upstream is slow, and how slow
  *   mcp_upstream_up{server}                     which upstreams are reachable right now
  *   mcp_audit_write_failures_total               tool calls that happened and were not recorded
+ *   mcp_upstream_tools{server}                   how many tools each upstream advertises
+ *   mcp_probe_cycle_completed_timestamp_seconds  when the health prober last finished a pass
  *
  * The tool-call series are registered here but only written from 5.4, when there is a
  * call path to instrument. They are declared now so the registry has one owner and the
@@ -35,6 +37,8 @@ export interface Metrics {
   toolCallDuration: Histogram<'server' | 'tool'>;
   upstreamUp: Gauge<'server'>;
   auditWriteFailures: Counter<string>;
+  upstreamTools: Gauge<'server'>;
+  probeCycleCompleted: Gauge<string>;
 }
 
 export function createMetrics(enabled: boolean): Metrics {
@@ -102,7 +106,56 @@ export function createMetrics(enabled: boolean): Metrics {
     registers: [registry],
   });
 
-  return { registry, toolCalls, toolCallDuration, upstreamUp, auditWriteFailures };
+  /**
+   * How many tools each upstream currently advertises.
+   *
+   * Answers a question neither of the other gauges can: an upstream that is up and
+   * reachable can still have silently stopped advertising half its tools - a bad deploy,
+   * a feature flag, a colliding prefixed name that 5.3's unique constraint rejected. From
+   * `mcp_upstream_up` alone that upstream looks perfectly healthy.
+   *
+   * Labelled by slug only. The alternative - a series per tool - would be a label whose
+   * values are supplied by an upstream, which is the cardinality trap described above.
+   */
+  const upstreamTools = new Gauge({
+    name: 'mcp_upstream_tools',
+    help: 'Number of tools currently cached for this upstream',
+    labelNames: ['server'] as const,
+    registers: [registry],
+  });
+
+  /**
+   * Unix seconds at which the health prober last completed a pass.
+   *
+   * This exists because of a property of `mcp_upstream_up` that is easy to miss: it is a
+   * gauge written by the prober, so if the prober stops, the gauge keeps its last value
+   * forever. Three upstreams reading 1 looks like a healthy system whether the prober ran
+   * a second ago or died an hour ago. **A metric that can go stale without saying so is
+   * worse than no metric**, because it is trusted.
+   *
+   * A timestamp rather than a counter of cycles, because the useful alert is
+   * `time() - mcp_probe_cycle_completed_timestamp_seconds > 60` - absolute, needs no rate
+   * window, and works from a single scrape. A counter would require two scrapes and a
+   * `rate()` to say the same thing.
+   *
+   * Set at the END of a cycle rather than the start, so a cycle that wedges mid-pass does
+   * not refresh it. Unlabelled: there is one prober per process.
+   */
+  const probeCycleCompleted = new Gauge({
+    name: 'mcp_probe_cycle_completed_timestamp_seconds',
+    help: 'Unix timestamp of the last completed upstream health probe cycle',
+    registers: [registry],
+  });
+
+  return {
+    registry,
+    toolCalls,
+    toolCallDuration,
+    upstreamUp,
+    auditWriteFailures,
+    upstreamTools,
+    probeCycleCompleted,
+  };
 }
 
 /**
@@ -119,4 +172,9 @@ export function forgetUpstream(metrics: Metrics, server: string): void {
     (metric as unknown as { remove: (...labels: string[]) => void }).remove(server);
   };
   remove(metrics.upstreamUp);
+  // The same removal for the tool count. Omitting it would recreate 5.2's bug in a new
+  // place: a deleted upstream still reporting, this time a tool count rather than a health
+  // of 1. Any per-slug series added anywhere needs a line here, which is the argument for
+  // there being exactly one place that forgets an upstream.
+  remove(metrics.upstreamTools);
 }
