@@ -40,10 +40,46 @@ export interface PoolEntry {
   lastValidatedAt?: number | undefined;
 }
 
+/**
+ * Why an upstream call failed, as a value rather than a sentence.
+ *
+ * This exists because of a bug that only became visible once 6.4 gave us an upstream that
+ * could be made slow on demand. The gateway had a `timeout` audit outcome and an
+ * `upstream_timeout` error code, and neither had ever fired: the pool wraps every failure
+ * in UpstreamUnavailableError, and the handler checks for that class before it checks for a
+ * request timeout, so the timeout branch below it was unreachable. Dead code that looked
+ * like a feature.
+ *
+ * The obvious fix - have the handler look for "timeout" in the reason string - is the exact
+ * thing decisions 2.75 and 2.83 forbid, twice over. The real fix is this: the pool ALREADY
+ * classifies the failure in order to write a readable reason, so it should hand over the
+ * classification it made rather than only the prose it wrote. A caller that needs the
+ * category gets the category.
+ *
+ * The general rule: **if a layer classifies something, pass the classification, not a
+ * sentence about it.** Prose is for humans; a second component reading it is coupling.
+ */
+export type UpstreamFailureKind =
+  /** The request outlived its budget. Nothing is claimed about whether it was delivered. */
+  | 'timeout'
+  /** The connection could not be established, was refused, or died. */
+  | 'unreachable'
+  /** The stored credential could not be decrypted. */
+  | 'credential'
+  /** The URL failed the SSRF guard - at registration time, or on re-validation. */
+  | 'url-forbidden'
+  /** The circuit breaker refused without attempting. Carries the previous reason. */
+  | 'backoff';
+
 export class UpstreamUnavailableError extends Error {
   constructor(
     readonly slug: string,
     readonly reason: string,
+    /**
+     * Defaults to 'unreachable' so a future throw site that forgets it degrades to the
+     * broadest honest category rather than silently claiming a timeout.
+     */
+    readonly kind: UpstreamFailureKind = 'unreachable',
   ) {
     // The slug is in the message on purpose. "Unreachable" with no subject is the thing
     // the brief explicitly asks us not to produce.
@@ -97,6 +133,22 @@ const MAX_BACKOFF_MS = 30_000;
 const BASE_BACKOFF_MS = 5_000;
 
 interface Connection {
+  /**
+   * Has any operation ever completed successfully over this connection?
+   *
+   * This is what separates "a slow tool" from "an upstream that is not there", and the
+   * distinction cannot be read off an error code. `client.connect()` does not round-trip
+   * for Streamable HTTP - it sets up the transport without talking to anyone - so a Service
+   * with zero endpoints connects happily and then hangs on the first real request, arriving
+   * as a request timeout indistinguishable from a tool that is merely slow.
+   *
+   * So the pool records evidence instead of inferring: a timeout on a connection that has
+   * never successfully done anything is treated as unreachability and trips the breaker,
+   * while a timeout on a connection that has demonstrably worked is treated as one slow
+   * call and does not. Both behaviours were measured, and getting one of them meant losing
+   * the other until this flag existed.
+   */
+  proven: boolean;
   client: Client;
   transport: StreamableHTTPClientTransport;
   /** The URL + header set this connection was built with, so a change can be detected. */
@@ -164,7 +216,11 @@ export class ClientPool {
         // Re-validation failed: the URL now resolves somewhere it should not. Drop the
         // connection rather than keep using it.
         await this.drop(target.id);
-        throw new UpstreamUnavailableError(target.slug, this.entry(target.id).lastError ?? 'revalidation failed');
+        throw new UpstreamUnavailableError(
+          target.slug,
+          this.entry(target.id).lastError ?? 'revalidation failed',
+          'url-forbidden',
+        );
       }
     }
 
@@ -201,6 +257,10 @@ export class ClientPool {
 
     try {
       const result = await operation(client);
+      // This connection has now demonstrably carried a request end to end, which is what
+      // lets a later timeout on it be read as "one slow call" rather than "nobody home".
+      const connection = this.connections.get(target.id);
+      if (connection !== undefined) connection.proven = true;
       // Reset on success. Without this a flapping upstream keeps a stale failure count
       // and backs off ever longer despite working.
       if (this.entry(target.id).consecutiveFailures > 0 || this.entry(target.id).status !== 'connected') {
@@ -209,14 +269,71 @@ export class ClientPool {
       }
       return result;
     } catch (error) {
-      const reason = describeUpstreamError(error);
-      // Drop the connection before recording the failure. The connection is, by
-      // definition, no longer known to work - keeping it would mean the next call pays
-      // the same timeout against the same dead socket instead of either reconnecting or
-      // failing fast on the backoff.
+      const { kind, reason } = describeUpstreamError(error);
+      // Read before the drop below removes the entry.
+      const wasProven = this.connections.get(target.id)?.proven ?? false;
+
+      /**
+       * Drop the connection either way. It is, by definition, no longer known to work -
+       * and on a timeout specifically the stream may still deliver a late response for a
+       * request this process has already given up on, so reusing it would risk pairing a
+       * reply with the wrong request.
+       */
       await this.drop(target.id);
-      this.recordFailure(target, reason);
-      throw new UpstreamUnavailableError(target.slug, reason);
+
+      /**
+       * But a TIMEOUT does not trip the circuit breaker, and that distinction took an
+       * upstream with a deliberately slow tool to find.
+       *
+       * `recordFailure` marks the upstream unreachable and refuses every call to it for
+       * the next 5-30 seconds. That is right when the upstream is actually down: it stops
+       * one dead server making every call pay the full timeout. It is wrong for a request
+       * timeout, because a slow TOOL is not a dead SERVER - the handshake succeeded and
+       * the request was accepted, and nothing about it says the next call will fail.
+       *
+       * Measured on a single replica before the fix: calling
+       * `trigger-long-running-operation` with a duration past its budget put the whole
+       * upstream into backoff, and `echo` - a tool that answers in 45ms - was then refused
+       * with the long-running call's reason. One deliberately slow tool denied access to
+       * the twelve healthy ones beside it. On a server whose stated purpose includes a
+       * long-running tool, any caller could do that to everyone else at will.
+       *
+       * So a timeout invalidates the CONNECTION, not the server's reachability. The
+       * consecutive-failure count is left alone, so a genuinely dead upstream still backs
+       * off on the first connect or transport failure.
+       *
+       * This is only expressible because the kind arrives as data. Deciding it from the
+       * reason string would have been the coupling 2.75 and 2.83 are about - and would have
+       * silently changed behaviour the next time that sentence was reworded.
+       */
+      if (kind !== 'timeout' || !wasProven) {
+        /**
+         * Trips the breaker. Either the failure was not a timeout at all - a refused
+         * connection, a dead transport - or it was a timeout on a connection that had
+         * never successfully carried anything, which is what a Service with no endpoints
+         * looks like from here. Both are evidence about the upstream rather than about one
+         * call, so backing off is right: it stops a dead upstream making every subsequent
+         * call pay the full budget.
+         */
+        this.recordFailure(target, reason);
+      } else {
+        /**
+         * A timeout on a connection that HAS worked. One slow call, not a dead server, so
+         * the connection is dropped and nothing else is concluded.
+         *
+         * Before this, a single slow tool put the whole upstream into backoff: measured on
+         * one replica, `trigger-long-running-operation` past its budget caused `echo` - a
+         * 45ms tool - to be refused with the long-running call's reason. Twelve healthy
+         * tools denied by one, on a server whose stated purpose includes being slow, by any
+         * caller who felt like it.
+         */
+        this.options.logger.warn(
+          { slug: target.slug, reason },
+          'upstream request timed out on a working connection; dropped it without tripping the breaker',
+        );
+      }
+
+      throw new UpstreamUnavailableError(target.slug, reason, kind);
     }
   }
 
@@ -271,6 +388,11 @@ export class ClientPool {
       throw new UpstreamUnavailableError(
         target.slug,
         `${entry.lastError ?? 'previous connection failed'} (not retrying for another ${Math.ceil(waitMs / 1000)}s)`,
+        // 'backoff', not the kind of the failure that caused it. What the caller is being
+        // told is "we did not attempt this", which is its own fact - and conflating it with
+        // the original cause would make a refusal that took 2ms look like a timeout that
+        // took the full budget, which is the class of lie 2.83 was about.
+        'backoff',
       );
     }
 
@@ -282,7 +404,7 @@ export class ClientPool {
     if (!guard.ok) {
       const reason = `the URL is not permitted: ${describeRejection(guard.reason)}`;
       this.recordFailure(target, reason);
-      throw new UpstreamUnavailableError(target.slug, reason);
+      throw new UpstreamUnavailableError(target.slug, reason, 'url-forbidden');
     }
 
     const client = new Client(
@@ -315,15 +437,16 @@ export class ClientPool {
       // a socket and its listeners behind, and a dead upstream being retried every 30s
       // accumulates them for as long as the pod lives.
       await safeClose(transport, this.options.logger, target.slug);
-      const reason = describeUpstreamError(error);
+      const { kind, reason } = describeUpstreamError(error);
       this.recordFailure(target, reason);
-      throw new UpstreamUnavailableError(target.slug, reason);
+      throw new UpstreamUnavailableError(target.slug, reason, kind);
     }
 
     this.connections.set(target.id, {
       client,
       transport,
       fingerprint: fingerprintTarget(target),
+      proven: false,
     });
     this.setState(target.id, {
       status: 'connected',
@@ -434,8 +557,8 @@ function fingerprintTarget(target: UpstreamTarget): string {
  * rather than reported as a connection failure, because the two have completely different
  * fixes and look identical from the outside.
  */
-function describeUpstreamError(error: unknown): string {
-  if (error instanceof CredentialError) return error.message;
+function describeUpstreamError(error: unknown): { kind: UpstreamFailureKind; reason: string } {
+  if (error instanceof CredentialError) return { kind: 'credential', reason: error.message };
 
   if (error instanceof Error) {
     /**
@@ -468,9 +591,13 @@ function describeUpstreamError(error: unknown): string {
            * an error code is the same mistake as reading one out of another component's
            * prose - decision 2.75 - and this time I made it in the fix for that.
            */
-          return 'the request did not complete within the timeout';
+          return { kind: 'timeout', reason: 'the request did not complete within the timeout' };
         case -32000:
-          return 'the connection closed before the call completed, which usually means the upstream stopped or restarted';
+          return {
+            kind: 'unreachable',
+            reason:
+              'the connection closed before the call completed, which usually means the upstream stopped or restarted',
+          };
         default:
           break;
       }
@@ -483,15 +610,18 @@ function describeUpstreamError(error: unknown): string {
 
     switch (code) {
       case 'ECONNREFUSED':
-        return 'connection refused: nothing is listening on that address and port';
+        return { kind: 'unreachable', reason: 'connection refused: nothing is listening on that address and port' };
       case 'ENOTFOUND':
       case 'EAI_AGAIN':
-        return 'the hostname could not be resolved';
+        return { kind: 'unreachable', reason: 'the hostname could not be resolved' };
       case 'ECONNRESET':
-        return 'the connection was reset before the handshake finished';
+        return { kind: 'unreachable', reason: 'the connection was reset before the handshake finished' };
       case 'UND_ERR_CONNECT_TIMEOUT':
       case 'ETIMEDOUT':
-        return 'the connection attempt timed out';
+        // A CONNECT timeout, which is unreachability rather than a slow answer - the
+        // handshake never completed. Classified as unreachable on purpose: only the SDK's
+        // own -32001 above means "we gave up waiting on a request".
+        return { kind: 'unreachable', reason: 'the connection attempt timed out' };
       default:
         break;
     }
@@ -504,7 +634,10 @@ function describeUpstreamError(error: unknown): string {
      * nothing they did not already know.
      */
     if (error.message === 'fetch failed') {
-      return 'the upstream could not be reached: the connection could not be opened';
+      return {
+        kind: 'unreachable',
+        reason: 'the upstream could not be reached: the connection could not be opened',
+      };
     }
 
     /**
@@ -522,15 +655,19 @@ function describeUpstreamError(error: unknown): string {
      * dashboard's status text, which the call-site version left untouched.
      */
     if (/connection closed/i.test(error.message)) {
-      return 'the connection closed before the call completed, which usually means the upstream stopped or restarted';
+      return {
+        kind: 'unreachable',
+        reason:
+          'the connection closed before the call completed, which usually means the upstream stopped or restarted',
+      };
     }
 
     // Trimmed, because an SDK error message can be long and the dashboard shows this in a
     // table cell. The full error is already in the log line next to it.
-    return error.message.slice(0, 200);
+    return { kind: 'unreachable', reason: error.message.slice(0, 200) };
   }
 
-  return String(error).slice(0, 200);
+  return { kind: 'unreachable', reason: String(error).slice(0, 200) };
 }
 
 async function safeClose(

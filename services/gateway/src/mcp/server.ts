@@ -32,7 +32,7 @@ import type { Logger } from '../logger.js';
 import type { Metrics } from '../metrics.js';
 import { listAggregatedTools, resolveTool } from './aggregator.js';
 import { splitToolName } from './naming.js';
-import { UpstreamUnavailableError, type ClientPool } from './pool.js';
+import { UpstreamUnavailableError, type ClientPool, type UpstreamFailureKind } from './pool.js';
 import { CredentialError, loadUpstream } from './upstreams.js';
 import { recordCalls, type AuditErrorCode, type AuditRow } from '../audit.js';
 
@@ -426,22 +426,35 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
        * silently the moment that wording improves.
        */
       if (error instanceof UpstreamUnavailableError) {
-        // The pool already reduced this to an operator-readable sentence - a connect
-        // timeout, a refused connection, a backoff refusal with its countdown. Forwarded
-        // verbatim rather than re-described, because the pool knows which it was and this
-        // handler does not.
+        /**
+         * The pool reduced this to BOTH a readable sentence and a category, and both are
+         * used: the sentence goes to the caller verbatim because the pool knows what
+         * happened and this handler does not, while the category decides the audit
+         * outcome.
+         *
+         * Before 6.4 this branch hardcoded `upstream_unreachable`, which made the
+         * `timeout` outcome and the `upstream_timeout` code unreachable - the check for a
+         * request timeout sits BELOW this one, and the pool wraps everything, so nothing
+         * ever got there. It took an upstream that could be made slow on demand to notice,
+         * because until 6.4 no test could produce a genuine request timeout at all.
+         */
+        const { outcome, code } = classifyUpstreamFailure(error.kind);
         return fail(
           `the server "${tool.serverSlug}" could not be reached: ${error.reason}`,
-          'error',
-          'upstream_unreachable',
+          outcome,
+          code,
           { slug: tool.serverSlug, id: tool.serverId },
         );
       }
 
       /**
-       * A RequestTimeout from the SDK: the request outlived its budget. That is the only
-       * case where quoting the configured timeout is truthful - the duration really is the
-       * one that elapsed.
+       * A RequestTimeout that did NOT come through the pool.
+       *
+       * Everything routed via `pool.use` is wrapped above, so in practice this branch is
+       * for a direct SDK call made outside the pool. Kept rather than deleted because the
+       * alternative - falling through to the generic handler - would record a genuine
+       * timeout as `upstream_unreachable`, which is the bug this step just fixed one layer
+       * up. It is a guard against reintroducing it by a different route.
        *
        * It does NOT establish that the upstream received anything. An earlier version said
        * "accepted the request but did not respond", and a Service with zero endpoints
@@ -468,6 +481,37 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
   }
 
   return { server, records };
+}
+
+/**
+ * Maps the pool's failure category onto the audit vocabulary.
+ *
+ * One place, so the two vocabularies cannot drift apart silently. Written as an exhaustive
+ * switch rather than a lookup object so that adding a kind to UpstreamFailureKind is a
+ * compile error here rather than a row quietly labelled with whatever the default was.
+ */
+function classifyUpstreamFailure(kind: UpstreamFailureKind): {
+  outcome: CallOutcome;
+  code: AuditErrorCode;
+} {
+  switch (kind) {
+    case 'timeout':
+      return { outcome: 'timeout', code: 'upstream_timeout' };
+    case 'credential':
+      return { outcome: 'error', code: 'credential_error' };
+    case 'url-forbidden':
+      // Not 'denied'. 'denied' is reserved for a decision about the CALLER - a disabled
+      // server, and in stage 9 a permission refusal. A URL that fails the SSRF guard is a
+      // misconfiguration or an attack on the gateway, which is an error about the upstream
+      // and belongs with the other upstream errors when someone filters the audit log.
+      return { outcome: 'error', code: 'upstream_unreachable' };
+    case 'backoff':
+    case 'unreachable':
+      // A backoff refusal records as unreachable, because that is what it is: the upstream
+      // was unreachable a moment ago and we did not try again. The reason string carries
+      // the countdown for whoever reads it.
+      return { outcome: 'error', code: 'upstream_unreachable' };
+  }
 }
 
 /**

@@ -87,24 +87,59 @@ everythingMcp:
     # not write.
     repository: urumi/everything-mcp
     tag: dev
+  # 1, and unlike notes-mcp the reason is not storage - it is that this server runs in
+  # SESSION mode. It generates an mcp-session-id on initialize and keeps the session in
+  # that process's memory, so a second replica would answer a client whose session it
+  # has never heard of. Scaling it would need sticky sessions at the ingress or a shared
+  # session store: infrastructure bought to solve a problem the server's own design
+  # created.
+  #
+  # This is the concrete argument for why OUR two servers are stateless, and it is worth
+  # having a live example of the alternative rather than only an opinion about it.
   replicas: 1
-  # Earns its place by being awkward: longRunningOperation is a real timeout demo, and
-  # printEnv is a real credential-leak test - it proves the gateway never forwards a
-  # client's token or its own environment to an upstream.
+  # Earns its place by being awkward. The two tools that matter:
+  #
+  #   trigger-long-running-operation  takes a duration in seconds, so it can be made to
+  #                                   outlast this upstream timeout on purpose - the one
+  #                                   way to exercise the upstream_timeout audit outcome
+  #                                   that 6.1 could not reach against a fast store.
+  #   get-env                         returns its whole environment to any caller, which
+  #                                   is a real credential-leak test rather than a
+  #                                   thought experiment: it proves the gateway forwards
+  #                                   neither a client's API key nor its own secrets.
+  #
+  # Those are the names version 1.0.0 actually registers. The plan was written against
+  # an older release that called them longRunningOperation and printEnv; the package was
+  # restructured and both were renamed. Checked against the published tarball rather
+  # than assumed, because a demo built on a guessed tool name fails live.
   resources:
     requests: { cpu: 25m, memory: 64Mi }
     limits: { cpu: 250m, memory: 192Mi }
   probes:
+    # tcpSocket, not httpGet, because this server has NO health endpoint - verified by
+    # grepping the published package, which serves only /mcp.
+    #
+    # The obvious alternative is probing /mcp, and it is worse. A GET without a session
+    # id answers 400, which an httpGet probe counts as a failure, so the pod would never
+    # become ready. A POST probe would have the kubelet open an MCP session every ten
+    # seconds and never close it, leaking a session per probe into that process memory.
+    #
+    # So this is a weaker check than the other two upstreams get, and that is the real
+    # trade: it proves the port is bound, not that the protocol works. The gateway own
+    # 15-second prober is what establishes whether this upstream answers tools/list -
+    # the layer that genuinely knows - and it reports that in the dashboard rather than
+    # silently restarting the pod.
     readiness:
-      httpGet: { path: /readyz, port: http }
+      tcpSocket: { port: http }
       periodSeconds: 10
     liveness:
-      httpGet: { path: /healthz, port: http }
+      tcpSocket: { port: http }
       periodSeconds: 30
       failureThreshold: 6
   securityContext:
     runAsUser: 1000
     runAsGroup: 1000
+    readOnlyRootFilesystem: true
   ports:
     - name: http
       containerPort: 3000

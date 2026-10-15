@@ -211,6 +211,18 @@ seed:
       url: http://upstreams-notes-mcp.mcp-upstreams.svc.cluster.local:3000/mcp
       authType: none
       timeoutMs: 10000
+    # Step 6.4 - the third-party server.
+    #
+    # timeoutMs is 5000, deliberately the shortest of the three, because this upstream is
+    # the timeout demo: trigger-long-running-operation takes a duration in seconds, so
+    # asking it for 10 against a 5s budget is a reproducible timeout rather than a lucky
+    # one. It is also the right number on its own terms - a server we did not write gets
+    # less of our patience than the store we did.
+    - name: Everything (reference server)
+      slug: everything
+      url: http://upstreams-everything-mcp.mcp-upstreams.svc.cluster.local:3000/mcp
+      authType: none
+      timeoutMs: 5000
   backoffLimit: 3
   resources:
     requests: { cpu: 50m, memory: 96Mi }

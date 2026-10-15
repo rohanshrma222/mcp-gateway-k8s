@@ -1,0 +1,22 @@
+{{- if .Values.everythingMcp.enabled }}
+{{/*
+ClusterIP, and that is the only address this server has. No Ingress, no NodePort.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "upstreams.everythingMcp.name" . }}
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "everything-mcp") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    {{- range .Values.everythingMcp.ports }}
+    - name: {{ .name }}
+      port: {{ .containerPort }}
+      targetPort: {{ .name }}
+      protocol: {{ .protocol | default "TCP" }}
+    {{- end }}
+  selector:
+    {{- include "common.selectorLabels" (dict "root" $ "component" "everything-mcp") | nindent 4 }}
+{{- end }}

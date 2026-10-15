@@ -1,0 +1,85 @@
+{{- if .Values.everythingMcp.enabled }}
+{{- $ctx := dict "root" $ "component" "everything-mcp" "spec" .Values.everythingMcp }}
+{{/*
+Step 6.4 - the upstream we did NOT write.
+
+The brief wants at least three upstream servers, and a system where every upstream was
+written by the same person is not really being tested: the interesting failures are the
+ones you do not control. This is the reference "everything" server, vendored as a pinned
+npm dependency and built into our own image - see services/everything-mcp/Dockerfile for
+why that beats pulling somebody's unofficial image onto the cluster that holds every
+upstream credential.
+
+It is NOT trusted. Same default-deny NetworkPolicy as notes-mcp, non-root, read-only root
+filesystem, every capability dropped, and - the part that matters most for this particular
+server - no credential anywhere in its environment, because one of its tools returns that
+environment to any caller who asks.
+
+No Ingress, as with every upstream here.
+
+replicas: 1 is forced by the server's own design rather than by storage: it runs in session
+mode, keeping each client's session in process memory. See values.yaml.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "upstreams.everythingMcp.name" . }}
+  labels:
+    {{- include "common.componentLabels" $ctx | nindent 4 }}
+spec:
+  replicas: {{ .Values.everythingMcp.replicas }}
+  # RollingUpdate is fine here - no volume to contend over, unlike notes-mcp. In-flight
+  # sessions on the old pod are lost, which is a real cost of session mode and one the
+  # gateway absorbs: the pool drops the connection, reconnects, and the next call
+  # establishes a fresh session.
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "common.selectorLabels" $ctx | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "common.selectorLabels" $ctx | nindent 8 }}
+    spec:
+      # Kubernetes injects an environment variable for every Service in the namespace
+      # unless told not to. Harmless for most workloads; not for this one, whose get-env
+      # tool hands its whole environment to any caller. Before this, that tool disclosed
+      # that notes-mcp exists and its ClusterIP address - to a server we did not write,
+      # through the gateway, to anyone holding an API key.
+      #
+      # It is only reconnaissance: egress is DNS-only, so this pod cannot reach what it
+      # learns about. But the point of defence in depth is that the layers do not depend
+      # on each other being perfect, and there is no reason this pod should know the
+      # addresses of its neighbours at all.
+      #
+      # Found by running get-env through the gateway and reading the output, not by
+      # reasoning about it - which is the argument for having a tool like that in the
+      # cluster in the first place.
+      enableServiceLinks: false
+      {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
+      {{- include "common.podSecurityContext" $ctx | nindent 6 }}
+      containers:
+        - name: everything-mcp
+          {{- include "common.containerDefaults" $ctx | nindent 10 }}
+          {{- include "common.containerPorts" $ctx | nindent 10 }}
+          env:
+            # PORT is the ONLY variable set here, and that is deliberate rather than
+            # minimal-by-accident. This server's get-env tool returns its entire
+            # environment to any caller, so every variable present is a variable published
+            # to anyone who can reach the gateway. There is nothing here worth publishing.
+            #
+            # The server defaults to 3001; 3000 keeps all three upstreams on one port so
+            # the probes and policies need no special case.
+            - name: PORT
+              value: {{ (first .Values.everythingMcp.ports).containerPort | quote }}
+          volumeMounts:
+            # The read-only root filesystem means the Node runtime cannot write a temp
+            # file, and one of this server's tools gzips a resource. An emptyDir names
+            # exactly what is writable instead of opening the whole filesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+{{- end }}

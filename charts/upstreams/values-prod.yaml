@@ -6,12 +6,33 @@ global:
   imagePullPolicy: Always
 
 notesMcp:
-  replicas: 2
+  # replicas stays at the default of 1, and this line exists to record why it is NOT
+  # raised here.
+  #
+  # This file originally said 2, written during the stage 1 scaffolding when notes-mcp was
+  # a name in a plan and nobody had decided how it would store anything. It stores notes in
+  # SQLite on a ReadWriteOnce volume, which permits exactly one writer on one node, so a
+  # second replica would either fail to schedule or - on a ReadWriteMany backend - give two
+  # processes a writable handle on one database file.
+  #
+  # Caught by the chart linter flagging that local and prod render different object sets,
+  # then reading why. Worth recording as the specific hazard of a prod overlay: it is the
+  # file least often rendered and never run, so a value that was reasonable when written
+  # can be contradicted months later by a decision made elsewhere, and nothing complains.
+  # Scaling this upstream means replacing SQLite, which is a code change, not a values one.
   persistence:
     size: 4Gi
 
 everythingMcp:
-  # Off by default in production. It is a demonstration and test fixture - printEnv and
-  # longRunningOperation are exactly the tools you would not leave registered on a real
-  # deployment - and saying so here is more honest than shipping it and hoping.
+  # Off in production. It is a demonstration and test fixture, and its two most useful
+  # tools are the two you would least want registered on a real deployment:
+  # get-env returns the whole process environment to any caller, and
+  # trigger-long-running-operation is an invitation to hold a connection open.
+  #
+  # (The plan called them printEnv and longRunningOperation; version 1.0.0 renamed both.
+  # Corrected here because a note naming tools that do not exist is worse than no note.)
+  #
+  # Saying so here is more honest than shipping it and hoping. The chart linter reports the
+  # resulting structural difference between local and prod, and that report is the point:
+  # it is confirmed deliberately rather than discovered by someone later.
   enabled: false

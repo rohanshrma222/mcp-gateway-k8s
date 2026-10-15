@@ -1,0 +1,10 @@
+{
+  "name": "@urumi/everything-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pinned wrapper around the reference MCP 'everything' server - a third-party upstream we did not write",
+  "dependencies": {
+    "@modelcontextprotocol/server-everything": "1.0.0"
+  }
+}
