@@ -52,6 +52,14 @@ export function mcpRoutes(deps: McpRouteDeps) {
         encryptionKey: deps.encryptionKey,
         principal,
         requestId: String(request.id),
+        /**
+         * Every call on this route arrived from an external MCP client holding a Bearer
+         * API key. Stage 8s chat agent reaches this same endpoint by this same code path
+         * and passes "chat" instead - which is exactly what makes its audit attribution
+         * unarguable: the row carries the real user, and the actor column records only
+         * which door they came through.
+         */
+        actor: "external",
       });
 
       // sessionIdGenerator is OMITTED rather than set to undefined - the same distinction

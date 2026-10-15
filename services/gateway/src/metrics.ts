@@ -6,6 +6,7 @@
  *   mcp_tool_calls_total{server,tool,outcome}   what is being used, and what is failing
  *   mcp_tool_call_duration_seconds{server,tool} which upstream is slow, and how slow
  *   mcp_upstream_up{server}                     which upstreams are reachable right now
+ *   mcp_audit_write_failures_total               tool calls that happened and were not recorded
  *
  * The tool-call series are registered here but only written from 5.4, when there is a
  * call path to instrument. They are declared now so the registry has one owner and the
@@ -33,6 +34,7 @@ export interface Metrics {
   toolCalls: Counter<'server' | 'tool' | 'outcome'>;
   toolCallDuration: Histogram<'server' | 'tool'>;
   upstreamUp: Gauge<'server'>;
+  auditWriteFailures: Counter<string>;
 }
 
 export function createMetrics(enabled: boolean): Metrics {
@@ -81,7 +83,26 @@ export function createMetrics(enabled: boolean): Metrics {
     registers: [registry],
   });
 
-  return { registry, toolCalls, toolCallDuration, upstreamUp };
+  /**
+   * Tool calls that happened and could not be written to the audit log.
+   *
+   * Exists because the audit write is allowed to fail without failing the call - see
+   * `recordCalls` for why that is the right choice once an upstream side effect has
+   * already landed. The whole justification for that leniency is that the gap is loud, and
+   * a log line alone is not loud: nobody alerts on log prose. This counter is what makes
+   * "the audit log is complete" a statement with evidence rather than a hope.
+   *
+   * Unlabelled on purpose. There is nothing to break down by - any non-zero value is the
+   * same incident class and wants the same response - and a label here would be one more
+   * place for caller-controlled text to reach the metric namespace.
+   */
+  const auditWriteFailures = new Counter({
+    name: 'mcp_audit_write_failures_total',
+    help: 'Tool calls that completed but could not be written to the audit log',
+    registers: [registry],
+  });
+
+  return { registry, toolCalls, toolCallDuration, upstreamUp, auditWriteFailures };
 }
 
 /**

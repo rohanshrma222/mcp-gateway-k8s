@@ -22,6 +22,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import {
   CallToolRequestSchema,
+  type CallToolRequest,
   ListToolsRequestSchema,
   type CallToolResult,
 } from '@modelcontextprotocol/sdk/types.js';
@@ -33,6 +34,7 @@ import { listAggregatedTools, resolveTool } from './aggregator.js';
 import { splitToolName } from './naming.js';
 import { UpstreamUnavailableError, type ClientPool } from './pool.js';
 import { CredentialError, loadUpstream } from './upstreams.js';
+import { recordCalls, type AuditErrorCode, type AuditRow } from '../audit.js';
 
 export interface GatewayServerDeps {
   db: Db;
@@ -43,16 +45,30 @@ export interface GatewayServerDeps {
   /** Who is calling. Resolved from the Bearer key before the server is built. */
   principal: ApiKeyPrincipal;
   requestId: string;
+  /**
+   * Which door the call came through.
+   *
+   * 'external' for a Bearer-authenticated MCP client such as Claude Code. Stage 8's chat
+   * agent passes 'chat' - and it is a parameter rather than a constant here precisely
+   * because that agent connects to this same endpoint by the same code path, which is what
+   * makes its audit attribution unarguable: it is the real user's row, distinguished only
+   * by the door.
+   */
+  actor: 'chat' | 'external';
 }
 
 /** Matches `audit_log.outcome`, so a metric label and a database row use one vocabulary. */
 export type CallOutcome = 'ok' | 'error' | 'denied' | 'timeout';
 
 export interface CallRecord {
+  serverId?: string;
   serverSlug?: string;
   toolName: string;
   outcome: CallOutcome;
+  /** The real start of the call, not the time the row is written. See audit.ts. */
+  startedAt: Date;
   durationMs: number;
+  errorCode?: AuditErrorCode;
   errorMessage?: string;
 }
 
@@ -67,10 +83,24 @@ export interface CallRecord {
  */
 export function buildGatewayServer(deps: GatewayServerDeps): {
   server: Server;
-  /** Populated as calls are handled, so the HTTP layer can write audit rows in 6.1. */
+  /**
+   * What this request did, as audit rows are written from it.
+   *
+   * Still exposed although the handler now writes its own rows: the HTTP layer uses it to
+   * tell a request that did nothing from one that called a tool, and a test can assert on
+   * it without reading the database.
+   */
   records: CallRecord[];
 } {
   const records: CallRecord[] = [];
+  /**
+   * How much of `records` has already been written.
+   *
+   * An index rather than clearing the array, because `records` is returned to the caller
+   * and the HTTP layer reads it after the response - emptying it on flush would make a
+   * handled call look like a request that did nothing.
+   */
+  let pendingFrom = 0;
 
   const server = new Server(
     { name: 'urumi-gateway', version: '0.1.0' },
@@ -124,17 +154,98 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
    * Order: resolve the prefixed name, check permission, call through the pool with a
    * timeout, and turn every failure into a structured result that names the server.
    */
+  /**
+   * The registered handler is a WRAPPER, and the structure is the point.
+   *
+   * `handleCall` below has eight return points - unknown tool, disabled server, bad
+   * credential, server deleted mid-call, unreachable, timeout, an upstream's own error,
+   * success. Writing the audit row at each one would mean the audit log is complete only
+   * as long as nobody adds a ninth and forgets, and the thing most likely to be forgotten
+   * is the path added in a hurry to handle a failure.
+   *
+   * So there is exactly ONE write point, and it sits where it cannot be bypassed: after
+   * the inner function returns, whatever it returns. The same argument produced
+   * `pool.use()` in 5.1 - if correctness depends on every caller remembering to report a
+   * result, it is the wrong interface.
+   *
+   * The write is awaited before the result is returned, so the client does not learn the
+   * outcome before the system has recorded it. `recordCalls` explains the one deliberate
+   * exception: once an upstream side effect has landed, a failed audit write is logged and
+   * counted rather than turned into a lie about a mutation that happened.
+   */
   server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
-    const startedAt = Date.now();
+    let result: CallToolResult;
+    try {
+      result = await handleCall(request);
+    } catch (error) {
+      /**
+       * handleCall is not expected to throw - every failure it knows about becomes an
+       * isError result. If it does, the call still happened and must still be recorded, so
+       * the row is written before the error propagates. An audit log that is complete
+       * except when something surprising happened is not much of an audit log.
+       */
+      records.push({
+        toolName: request.params.name,
+        outcome: 'error',
+        startedAt: new Date(),
+        durationMs: 0,
+        errorCode: 'internal_error',
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
+      await flushRecords();
+      throw error;
+    }
+
+    await flushRecords();
+    return result;
+  });
+
+  /** Drains `records` into the audit log. Called once per handled call. */
+  async function flushRecords(): Promise<void> {
+    if (pendingFrom >= records.length) return;
+    const fresh = records.slice(pendingFrom);
+    pendingFrom = records.length;
+
+    const rows: AuditRow[] = fresh.map((record) => ({
+      userId: deps.principal.userId,
+      apiKeyId: deps.principal.apiKeyId,
+      userEmail: deps.principal.email,
+      toolName: record.toolName,
+      startedAt: record.startedAt,
+      durationMs: record.durationMs,
+      outcome: record.outcome,
+      actor: deps.actor,
+      requestId: deps.requestId,
+      ...(record.serverId === undefined ? {} : { serverId: record.serverId }),
+      ...(record.serverSlug === undefined ? {} : { serverSlug: record.serverSlug }),
+      ...(record.errorCode === undefined ? {} : { errorCode: record.errorCode }),
+      ...(record.errorMessage === undefined ? {} : { errorMessage: record.errorMessage }),
+    }));
+
+    await recordCalls(deps.db, deps.logger, deps.metrics, rows);
+  }
+
+  async function handleCall(request: CallToolRequest): Promise<CallToolResult> {
+    const startedAtMs = Date.now();
+    const startedAt = new Date(startedAtMs);
     const exposedName = request.params.name;
 
-    const finish = (outcome: CallOutcome, message?: string, slug?: string): void => {
-      const durationMs = Date.now() - startedAt;
+    const finish = (
+      outcome: CallOutcome,
+      message?: string,
+      server?: { slug: string; id?: string },
+      code?: AuditErrorCode,
+    ): void => {
+      const durationMs = Date.now() - startedAtMs;
+      const slug = server?.slug;
       records.push({
         toolName: exposedName,
         outcome,
+        startedAt,
         durationMs,
         ...(slug === undefined ? {} : { serverSlug: slug }),
+        ...(server?.id === undefined ? {} : { serverId: server.id }),
+        ...(code === undefined ? {} : { errorCode: code }),
         ...(message === undefined ? {} : { errorMessage: message }),
       });
 
@@ -155,8 +266,13 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
      * information the model can act on - try a different tool, tell the user that server
      * is down, ask for a different argument.
      */
-    const fail = (message: string, outcome: CallOutcome, slug?: string): CallToolResult => {
-      finish(outcome, message, slug);
+    const fail = (
+      message: string,
+      outcome: CallOutcome,
+      code: AuditErrorCode,
+      server?: { slug: string; id?: string },
+    ): CallToolResult => {
+      finish(outcome, message, server, code);
       deps.logger.warn(
         {
           requestId: deps.requestId,
@@ -177,7 +293,8 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
         return fail(
           `the server "${resolved.reason.slug}" is currently disabled, so "${exposedName}" cannot be called. An administrator can re-enable it.`,
           'denied',
-          resolved.reason.slug,
+          'server_disabled',
+          { slug: resolved.reason.slug },
         );
       }
 
@@ -190,7 +307,7 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
         guess === undefined
           ? 'Tool names are of the form <server>__<tool>; call tools/list to see what is available.'
           : `No server "${guess.slug}" exposes a tool matching that name. Call tools/list to see what is available.`;
-      return fail(`unknown tool "${exposedName}". ${hint}`, 'error');
+      return fail(`unknown tool "${exposedName}". ${hint}`, 'error', 'unknown_tool');
     }
 
     const tool = resolved.tool;
@@ -217,7 +334,7 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
       if (error instanceof CredentialError) {
         // Named rather than reported as a connection failure: a rotated encryption key and
         // an unreachable server look identical from outside and have different fixes.
-        return fail(error.message, 'error', tool.serverSlug);
+        return fail(error.message, 'error', 'credential_error', { slug: tool.serverSlug, id: tool.serverId });
       }
       throw error;
     }
@@ -228,7 +345,8 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
       return fail(
         `the server "${tool.serverSlug}" was removed while this call was being prepared`,
         'error',
-        tool.serverSlug,
+        'server_removed',
+        { slug: tool.serverSlug },
       );
     }
 
@@ -258,7 +376,24 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
       // means the call round-tripped and the answer was negative - "no such order 999" -
       // which the model should see verbatim rather than wrapped in our own phrasing.
       const upstreamFailed = result.isError === true;
-      finish(upstreamFailed ? 'error' : 'ok', undefined, tool.serverSlug);
+      /**
+       * When the upstream says no, its own words go in the audit row.
+       *
+       * The first version passed `undefined` here, because this branch forwards the result
+       * verbatim and never builds a message of its own. Querying the table showed the
+       * consequence: a row reading `outcome=error, error_code=upstream_error` with an
+       * empty reason - which is the exact failure `003_audit_log.sql` warns about in
+       * another context, a row that "looks like data" while saying nothing. An operator
+       * asking why a call failed would have had to go and find the gateway's logs.
+       *
+       * The text is already in the result; it just had to be read out of it.
+       */
+      finish(
+        upstreamFailed ? 'error' : 'ok',
+        upstreamFailed ? describeResultError(result) : undefined,
+        { slug: tool.serverSlug, id: tool.serverId },
+        upstreamFailed ? 'upstream_error' : undefined,
+      );
 
       deps.logger.info(
         {
@@ -268,7 +403,7 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
           server: tool.serverSlug,
           tool: exposedName,
           upstreamTool: tool.upstreamToolName,
-          durationMs: Date.now() - startedAt,
+          durationMs: Date.now() - startedAtMs,
           outcome: upstreamFailed ? 'error' : 'ok',
         },
         'tool call completed',
@@ -298,7 +433,8 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
         return fail(
           `the server "${tool.serverSlug}" could not be reached: ${error.reason}`,
           'error',
-          tool.serverSlug,
+          'upstream_unreachable',
+          { slug: tool.serverSlug, id: tool.serverId },
         );
       }
 
@@ -311,7 +447,8 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
         return fail(
           `the server "${tool.serverSlug}" accepted the request but did not respond within ${loaded.target.timeoutMs}ms`,
           'timeout',
-          tool.serverSlug,
+          'upstream_timeout',
+          { slug: tool.serverSlug, id: tool.serverId },
         );
       }
 
@@ -319,12 +456,61 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
       return fail(
         `the server "${tool.serverSlug}" could not be reached: ${reason}`,
         'error',
-        tool.serverSlug,
+        'upstream_unreachable',
+        { slug: tool.serverSlug, id: tool.serverId },
       );
     }
-  });
+  }
 
   return { server, records };
+}
+
+/**
+ * Pulls a readable reason out of an upstream's own error result.
+ *
+ * An MCP result carries a list of content blocks, and only text blocks have anything an
+ * audit row can use. Non-text blocks - an image, audio, an embedded resource - are
+ * described by type rather than skipped silently, because "the tool failed and returned a
+ * picture" is itself worth knowing when someone is trying to work out what happened.
+ */
+function describeResultError(result: unknown): string {
+  if (typeof result !== 'object' || result === null) {
+    return 'the upstream reported an error with no message';
+  }
+
+  /**
+   * `unknown` rather than CallToolResult, because the SDK types a call result as a UNION:
+   * the modern `{ content: [...] }` shape, or a legacy `{ toolResult: unknown }` one kept
+   * for older servers. Typing the parameter as the modern shape does not compile, and
+   * casting it would have been a lie that held until the first legacy upstream arrived -
+   * precisely the kind of upstream a gateway exists to accommodate. So both shapes are
+   * read, and anything else degrades to a sentence rather than throwing inside the audit
+   * path.
+   */
+  const content = (result as { content?: unknown }).content;
+  if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content as { type?: unknown; text?: unknown }[]) {
+      if (block.type === 'text' && typeof block.text === 'string') {
+        parts.push(block.text);
+      } else if (typeof block.type === 'string') {
+        // Described rather than skipped: "the tool failed and returned a picture" is
+        // itself worth knowing to someone working out what happened.
+        parts.push(`[${block.type} content]`);
+      }
+    }
+    const joined = parts.join(' ').trim();
+    if (joined !== '') return joined;
+  }
+
+  const legacy = (result as { toolResult?: unknown }).toolResult;
+  if (legacy !== undefined) {
+    return typeof legacy === 'string' ? legacy : JSON.stringify(legacy).slice(0, 500);
+  }
+
+  // A tool is allowed to flag an error with no content at all. Saying so beats an empty
+  // column, which is indistinguishable from a bug in this code.
+  return 'the upstream reported an error with no message';
 }
 
 /**
