@@ -103,6 +103,7 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
   await app.register(
     authRoutes({
       db,
+      logger,
       jwtSecret: config.JWT_SECRET,
       cookieSecure: config.COOKIE_SECURE,
       requireAuth: requireAuth as never,

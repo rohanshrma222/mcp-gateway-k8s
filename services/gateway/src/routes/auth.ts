@@ -1,16 +1,18 @@
 /**
  * Authentication routes: log in, log out, and "who am I".
  */
+import { randomBytes } from 'node:crypto';
 import type { FastifyInstance, FastifyPluginOptions } from 'fastify';
 import { z } from 'zod';
 import type { Db } from '../db.js';
+import type { Logger } from '../logger.js';
 import {
   clearSessionCookie,
   requireRole,
   sessionCookieOptions,
   type Principal,
 } from '../auth/middleware.js';
-import { getDummyHash, verifyPassword } from '../auth/passwords.js';
+import { getDummyHash, hashPassword, verifyPassword } from '../auth/passwords.js';
 import { SESSION_COOKIE, sessionTtlSeconds, signSession, type Role } from '../auth/tokens.js';
 
 const loginBody = z.object({
@@ -18,8 +20,39 @@ const loginBody = z.object({
   password: z.string().min(1).max(1024),
 });
 
+/** Invite body. The password is generated, never supplied. */
+const inviteBody = z.object({
+  // Trimmed and lowercased, so "Admin@Urumi.local " and "admin@urumi.local" cannot become
+  // two accounts. The unique index is on lower(email), so the database would reject the
+  // second anyway - this makes the stored value match what the index compares.
+  email: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .min(3)
+    .max(320)
+    .refine((value) => value.includes('@'), 'must be an email address'),
+  role: z.enum(['admin', 'member']).default('member'),
+});
+
+const patchUserBody = z.object({
+  role: z.enum(['admin', 'member']).optional(),
+  disabled: z.boolean().optional(),
+});
+
+const userIdParam = z.object({ id: z.string().uuid() });
+
 export interface AuthRouteDeps {
   db: Db;
+  /**
+   * Added in 7.3 for the invite and role-change routes.
+   *
+   * Those two are the first writes in this file that an operator would want a record of
+   * outside the audit log - the audit table is for TOOL calls, deliberately, so a
+   * membership change has no row there. A log line with a request id is what ties "who
+   * promoted this person" to a point in time.
+   */
+  logger: Logger;
   jwtSecret: string;
   cookieSecure: boolean;
   requireAuth: (request: never, reply: never) => Promise<void>;
@@ -188,6 +221,240 @@ export function authRoutes(deps: AuthRouteDeps) {
             // and the exact moment an account was disabled is an audit-log question.
             disabled: row.disabled_at !== null,
           })),
+          requestId: request.id,
+        });
+      },
+    );
+
+    /**
+     * POST /api/users - invite a member. Admin only.
+     *
+     * **How a new account gets a password**, which is the decision worth defending here.
+     * The gateway has no mail transport, so the three honest options were: a signed invite
+     * link the admin copies and sends, a password the admin chooses, or a password the
+     * server generates and returns exactly once.
+     *
+     * This is the third, for the same reason API keys work that way (4.4): a generated
+     * secret is 32 bytes of CSPRNG output rather than something a human picked under
+     * pressure, and returning it once means there is no endpoint that could ever return it
+     * again. An admin-chosen password would be the weakest of the three and is the one most
+     * systems ship.
+     *
+     * What this is NOT is a complete invitation flow. A real deployment wants a
+     * single-use, expiring link and a forced password change on first sign-in - there is no
+     * `must_change_password` column here, so the generated password stays valid until the
+     * member changes it, and nothing forces them to. That is a genuine gap and it is
+     * written down rather than implied; closing it is a migration and a flag, not a
+     * redesign.
+     */
+    app.post(
+      '/api/users',
+      { preHandler: [deps.requireAuth as never, requireRole('admin') as never] },
+      async (request, reply) => {
+        const parsed = inviteBody.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(400).send({
+            error: 'invalid request',
+            issues: parsed.error.issues.map((issue) => ({
+              field: issue.path.join('.'),
+              message: issue.message,
+            })),
+          });
+        }
+
+        const { email, role } = parsed.data;
+
+        /**
+         * 24 bytes of base64url - about 190 bits.
+         *
+         * Deliberately not a memorable passphrase. This value is copied once and pasted
+         * into a password manager, so being typeable is worth nothing and being
+         * unguessable is worth everything. It is hashed with the same argon2id parameters
+         * the login route verifies against, by calling the same function, which is the
+         * invariant 4.3 established after the WordPress application-password episode: one
+         * implementation of one format.
+         */
+        const initialPassword = randomBytes(24).toString('base64url');
+        const passwordHash = await hashPassword(initialPassword);
+
+        try {
+          const result = await deps.db.query<{ id: string; created_at: Date }>(
+            `INSERT INTO users (email, password_hash, role)
+                  VALUES ($1, $2, $3)
+               ON CONFLICT (lower(email)) DO NOTHING
+                 RETURNING id, created_at`,
+            [email, passwordHash, role],
+          );
+
+          /**
+           * DO NOTHING plus an empty result means the address is taken.
+           *
+           * Reported as a 409 with the address, which does disclose that an account
+           * exists - and that is the right trade here, unlike on the login route. This
+           * endpoint is admin-only, and an admin inviting somebody who already has an
+           * account needs to be told that rather than left wondering why no password
+           * appeared. Login stays deliberately ambiguous because it is unauthenticated.
+           */
+          if (result.rows.length === 0) {
+            return reply.code(409).send({ error: `an account for ${email} already exists` });
+          }
+
+          const row = result.rows[0];
+          if (row === undefined) throw new Error('insert returned no row');
+
+          deps.logger.info(
+            { invitedBy: (request as { principal?: { userId?: string } }).principal?.userId, email, role },
+            'member invited',
+          );
+
+          return reply.code(201).send({
+            user: { id: row.id, email, role, createdAt: row.created_at, disabled: false },
+            /**
+             * The plaintext, here and nowhere else, ever.
+             *
+             * Not logged - the logger's redaction list covers `password`, and the log line
+             * above carries the email and role only. Not stored: the column holds an
+             * argon2id hash. There is no endpoint that can return this again, which is the
+             * property that makes "shown once" true rather than merely intended.
+             */
+            initialPassword,
+            requestId: request.id,
+          });
+        } catch (error) {
+          // 23514 is a CHECK violation - the role CHECK on the users table. Surfaced as a
+          // 400 rather than a 500, because it means the request was wrong, not the server.
+          if (typeof error === 'object' && error !== null && (error as { code?: string }).code === '23514') {
+            return reply.code(400).send({ error: 'role must be admin or member' });
+          }
+          throw error;
+        }
+      },
+    );
+
+    /**
+     * PATCH /api/users/:id - change a role, or disable an account. Admin only.
+     *
+     * Two guards here, and they exist because this endpoint can lock everyone out of the
+     * system permanently.
+     *
+     * **An admin cannot demote or disable themselves.** The immediate effect would be
+     * losing their own session's authority mid-request - 4.3 made `requireAuth` re-read
+     * the user row every request specifically so a change takes effect at once - so the
+     * admin would be signed out of admin by their own click, with no undo path. Refused
+     * with an explanation rather than performed.
+     *
+     * **The last enabled admin cannot be demoted or disabled either.** There is no
+     * endpoint that creates an admin without already being one, and the seed Job only runs
+     * on a Helm install or upgrade - so removing the final admin means nobody can ever
+     * administer this deployment again without direct database access. That is a one-click
+     * unrecoverable state, which is precisely the kind of thing an interface should refuse.
+     *
+     * The count and the update run in ONE statement rather than a read-then-write, because
+     * two concurrent requests each demoting a different one of the last two admins would
+     * both pass a separate check and leave zero. The `EXISTS` subquery is evaluated
+     * against the same snapshot as the update.
+     */
+    app.patch(
+      '/api/users/:id',
+      { preHandler: [deps.requireAuth as never, requireRole('admin') as never] },
+      async (request, reply) => {
+        const idParsed = userIdParam.safeParse(request.params);
+        if (!idParsed.success) return reply.code(400).send({ error: 'a user id is required' });
+
+        const parsed = patchUserBody.safeParse(request.body);
+        if (!parsed.success) {
+          return reply.code(400).send({
+            error: 'invalid request',
+            issues: parsed.error.issues.map((issue) => ({
+              field: issue.path.join('.'),
+              message: issue.message,
+            })),
+          });
+        }
+
+        const { id } = idParsed.data;
+        const patch = parsed.data;
+        if (patch.role === undefined && patch.disabled === undefined) {
+          return reply.code(400).send({ error: 'nothing to change: send role, disabled, or both' });
+        }
+
+        const principal = (request as { principal?: { userId: string } }).principal;
+        const actorId = principal?.userId;
+
+        // Self-protection. Checked before touching the database, because the answer does
+        // not depend on any row.
+        const removesOwnAdmin = patch.role === 'member' || patch.disabled === true;
+        if (actorId === id && removesOwnAdmin) {
+          return reply.code(409).send({
+            error:
+              'you cannot remove your own admin access or disable your own account - ask another admin to do it',
+          });
+        }
+
+        const result = await deps.db.query<{
+          id: string;
+          email: string;
+          role: Role;
+          created_at: Date;
+          disabled_at: Date | null;
+        }>(
+          `UPDATE users AS u
+               SET role        = COALESCE($2, u.role),
+                   disabled_at = CASE
+                                   WHEN $3::boolean IS NULL THEN u.disabled_at
+                                   WHEN $3::boolean THEN COALESCE(u.disabled_at, now())
+                                   ELSE NULL
+                                 END
+             WHERE u.id = $1
+               -- The last-admin guard, in the same statement as the write. A
+               -- read-then-write would let two concurrent demotions of the last two
+               -- admins each pass their own check and leave none.
+               AND (
+                 NOT $4::boolean
+                 OR EXISTS (
+                   SELECT 1 FROM users other
+                    WHERE other.id <> u.id
+                      AND other.role = 'admin'
+                      AND other.disabled_at IS NULL
+                 )
+               )
+         RETURNING u.id, u.email, u.role, u.created_at, u.disabled_at`,
+          [id, patch.role ?? null, patch.disabled ?? null, removesOwnAdmin],
+        );
+
+        if (result.rows.length === 0) {
+          /**
+           * Either the row does not exist, or the guard blocked it. Distinguished with a
+           * second query rather than guessed, because "no such user" and "that is the last
+           * admin" send an operator to completely different places.
+           */
+          const exists = await deps.db.query<{ role: Role; disabled_at: Date | null }>(
+            'SELECT role, disabled_at FROM users WHERE id = $1',
+            [id],
+          );
+          if (exists.rows.length === 0) return reply.code(404).send({ error: 'no such user' });
+          return reply.code(409).send({
+            error:
+              'this is the last enabled admin - promote somebody else first, or nobody will be able to administer this deployment',
+          });
+        }
+
+        const row = result.rows[0];
+        if (row === undefined) throw new Error('update returned no row');
+
+        deps.logger.info(
+          { changedBy: actorId, userId: id, role: row.role, disabled: row.disabled_at !== null },
+          'member changed',
+        );
+
+        return reply.send({
+          user: {
+            id: row.id,
+            email: row.email,
+            role: row.role,
+            createdAt: row.created_at,
+            disabled: row.disabled_at !== null,
+          },
           requestId: request.id,
         });
       },
