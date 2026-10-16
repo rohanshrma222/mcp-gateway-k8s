@@ -391,55 +391,162 @@ export function authRoutes(deps: AuthRouteDeps) {
           });
         }
 
-        const result = await deps.db.query<{
-          id: string;
-          email: string;
-          role: Role;
-          created_at: Date;
-          disabled_at: Date | null;
-        }>(
-          `UPDATE users AS u
-               SET role        = COALESCE($2, u.role),
-                   disabled_at = CASE
-                                   WHEN $3::boolean IS NULL THEN u.disabled_at
-                                   WHEN $3::boolean THEN COALESCE(u.disabled_at, now())
-                                   ELSE NULL
-                                 END
-             WHERE u.id = $1
-               -- The last-admin guard, in the same statement as the write. A
-               -- read-then-write would let two concurrent demotions of the last two
-               -- admins each pass their own check and leave none.
-               AND (
-                 NOT $4::boolean
-                 OR EXISTS (
-                   SELECT 1 FROM users other
-                    WHERE other.id <> u.id
-                      AND other.role = 'admin'
-                      AND other.disabled_at IS NULL
-                 )
-               )
-         RETURNING u.id, u.email, u.role, u.created_at, u.disabled_at`,
-          [id, patch.role ?? null, patch.disabled ?? null, removesOwnAdmin],
-        );
+        /**
+         * The last-admin guard runs inside a transaction that LOCKS the admin rows, and
+         * the reason is a correction worth recording.
+         *
+         * The first version put the check in the UPDATE's own WHERE clause as an EXISTS
+         * subquery, on the reasoning that one statement is one atomic evaluation and
+         * therefore safe against a read-then-write race. **That was wrong, and testing it
+         * proved so.** Two concurrent demotions - admin A demoting B while B demotes A -
+         * each evaluate their EXISTS against their own snapshot, each sees the *other*
+         * admin still enabled, both pass, both commit. Measured against the live database:
+         * two enabled admins in, **zero** out.
+         *
+         * Being in one statement makes it atomic with respect to ITSELF. It does nothing
+         * about a second statement in a second transaction, which is the case the guard
+         * exists for - so the guard was decorative in exactly the scenario it was written
+         * to prevent.
+         *
+         * `FOR UPDATE` on the enabled-admin rows is what actually serialises them: the
+         * second transaction blocks until the first commits, then re-reads and sees the
+         * truth. It has to be a transaction rather than one clever statement, which is the
+         * honest shape of the problem.
+         *
+         * Note the guard is unreachable through a single HTTP request, and that is not a
+         * reason to drop it. The caller must be an enabled admin, so if the target is a
+         * *different* person the target cannot be the last admin - which leaves only
+         * self-demotion, and the self-protection check above catches that first. The race
+         * is the one path that reaches it, and it is the path that matters.
+         */
+        const client = await deps.db.connect();
+        type UserRow = { id: string; email: string; role: Role; created_at: Date; disabled_at: Date | null };
+        // undefined means "the write did not run", which is a third state distinct from
+        // "ran and matched nothing". Modelling it as undefined rather than a
+        // definitely-assigned variable plus a non-null assertion keeps the compiler
+        // checking the branch instead of being told to trust it.
+        let rows: UserRow[] | undefined;
+        let blockedByLastAdmin = false;
 
-        if (result.rows.length === 0) {
+        try {
+          await client.query('BEGIN');
+
+          if (removesOwnAdmin) {
+            /**
+             * Lock every currently-enabled admin row, then count.
+             *
+             * The lock is the whole point - the count is only trustworthy because no
+             * concurrent transaction can change these rows until this one ends. Locking
+             * the set rather than one row is deliberate: the question is "how many admins
+             * are there", so every row that could answer it differently has to be held.
+             */
+            /**
+             * Lock EVERY enabled admin row, ordered by id, and exclude the target
+             * afterwards in JavaScript.
+             *
+             * The ordering is the fix for a deadlock that the first locking version
+             * produced, and it is worth writing down because the symptom was a *correct
+             * outcome by accident*.
+             *
+             * That version locked `... AND id <> $1` - the admins other than the target.
+             * So with two admins demoting each other: A's transaction locked A's row and
+             * then wrote B's, while B's locked B's row and then wrote A's. Each held what
+             * the other needed. Postgres detected the cycle and killed one, which left
+             * exactly one admin standing - the right answer - but delivered as **HTTP 500
+             * "Internal Server Error"** instead of the 409 explaining what happened. A
+             * guard that works by deadlock detection is not a guard; it is luck with a
+             * stack trace.
+             *
+             * Locking the whole set in a deterministic order means both transactions ask
+             * for the same locks in the same sequence, so the second simply waits. When it
+             * resumes it re-reads committed state, finds itself the only admin left, and
+             * refuses with the message a human can act on.
+             *
+             * `ORDER BY id` is doing real work here and is not stylistic: without a
+             * deterministic order two transactions can still acquire the same rows in
+             * different sequences and deadlock again.
+             */
+            const locked = await client.query<{ id: string }>(
+              `SELECT id FROM users
+                 WHERE role = 'admin' AND disabled_at IS NULL
+                 ORDER BY id
+                 FOR UPDATE`,
+            );
+            // The target does not count towards "is anyone else left".
+            const othersRemaining = locked.rows.filter((row) => row.id !== id).length;
+            if (othersRemaining === 0) {
+              blockedByLastAdmin = true;
+            }
+          }
+
+          if (blockedByLastAdmin) {
+            await client.query('ROLLBACK');
+          } else {
+            const updated = await client.query<UserRow>(
+              `UPDATE users AS u
+                   SET role        = COALESCE($2, u.role),
+                       disabled_at = CASE
+                                       WHEN $3::boolean IS NULL THEN u.disabled_at
+                                       WHEN $3::boolean THEN COALESCE(u.disabled_at, now())
+                                       ELSE NULL
+                                     END
+                 WHERE u.id = $1
+             RETURNING u.id, u.email, u.role, u.created_at, u.disabled_at`,
+              [id, patch.role ?? null, patch.disabled ?? null],
+            );
+            await client.query('COMMIT');
+            rows = updated.rows;
+          }
+        } catch (error) {
+          // Rolled back on any failure, so a thrown error cannot leave a transaction - and
+          // therefore the admin-row locks - open on a pooled connection. Without this the
+          // next request to get that connection would inherit an aborted transaction and
+          // fail for no visible reason.
+          await client.query('ROLLBACK').catch(() => undefined);
+
           /**
-           * Either the row does not exist, or the guard blocked it. Distinguished with a
-           * second query rather than guessed, because "no such user" and "that is the last
-           * admin" send an operator to completely different places.
+           * 40P01 is a deadlock. The ordered lock above is meant to make this
+           * unreachable, and this branch exists because "meant to" is not a guarantee
+           * worth handing a user a 500 over - that is exactly what the unordered version
+           * did. 409 with an invitation to retry is both true and actionable.
            */
-          const exists = await deps.db.query<{ role: Role; disabled_at: Date | null }>(
-            'SELECT role, disabled_at FROM users WHERE id = $1',
-            [id],
-          );
-          if (exists.rows.length === 0) return reply.code(404).send({ error: 'no such user' });
+          if (typeof error === 'object' && error !== null && (error as { code?: string }).code === '40P01') {
+            deps.logger.warn({ userId: id }, 'deadlock while changing a member - lock ordering may have regressed');
+            return reply.code(409).send({
+              error: 'another change to the admin list happened at the same moment - please try again',
+            });
+          }
+
+          throw error;
+        } finally {
+          // Always released. A leaked client is one fewer connection forever, and
+          // `poolMax` is 10 per replica.
+          client.release();
+        }
+
+        if (blockedByLastAdmin) {
           return reply.code(409).send({
             error:
               'this is the last enabled admin - promote somebody else first, or nobody will be able to administer this deployment',
           });
         }
 
-        const row = result.rows[0];
+
+
+        /**
+         * Now unambiguous: the guard answers its own case above with a 409, so an empty
+         * result can only mean the row does not exist.
+         *
+         * The previous version needed a second query here to tell the two apart. Moving
+         * the guard into the transaction removed that - the error each caller gets is
+         * decided by the branch that knows why, rather than reconstructed afterwards from
+         * the absence of a row.
+         */
+        if (rows === undefined || rows.length === 0) {
+          return reply.code(404).send({ error: 'no such user' });
+        }
+
+        const row = rows[0];
         if (row === undefined) throw new Error('update returned no row');
 
         deps.logger.info(

@@ -18,6 +18,7 @@ import { SessionProvider, useSession } from './auth/session.js';
 import { Login } from './routes/Login.js';
 import { Shell } from './routes/Shell.js';
 import { Servers } from './routes/Servers.js';
+import { Audit } from './routes/Audit.js';
 
 export function App() {
   return (
@@ -76,7 +77,7 @@ function Tree() {
         <Route path="tools" element={<Pending title="Tools" step="7.2" />} />
         <Route path="members" element={<Pending title="Members" step="7.3" />} />
         <Route path="keys" element={<Pending title="API keys" step="7.3" />} />
-        <Route path="audit" element={<Pending title="Audit" step="7.4" />} />
+        <Route path="audit" element={<Audit />} />
         <Route path="chat" element={<Pending title="Chat" step="8.3" />} />
         {/* An unknown path inside the app goes home rather than showing a 404. The nav is
             the only way to reach these routes, so a bad path here is a stale bookmark. */}
