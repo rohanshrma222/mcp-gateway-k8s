@@ -108,12 +108,22 @@ export function parseKey(presented: string): ParsedKey | undefined {
   return { keyId, secret };
 }
 
+/**
+ * What kind of key this is, and therefore which actor the audit log records.
+ *
+ * Read from the database rather than taken from the request, which is the whole point of
+ * migration 007: a client cannot mint a key, so it cannot choose its own actor. See that
+ * migration for why a header would have been wrong.
+ */
+export type ApiKeyKind = 'standard' | 'chat';
+
 export interface ApiKeyPrincipal {
   userId: string;
   email: string;
   role: Role;
   apiKeyId: string;
   keyId: string;
+  kind: ApiKeyKind;
 }
 
 export type ResolveFailure = 'malformed' | 'unknown' | 'revoked' | 'user-disabled';
@@ -147,9 +157,10 @@ export async function resolveApiKey(db: Db, presented: string): Promise<ResolveR
     user_id: string;
     email: string;
     role: Role;
+    kind: string;
     user_disabled_at: Date | null;
   }>(
-    `SELECT k.id, k.key_id, k.secret_sha256, k.revoked_at,
+    `SELECT k.id, k.key_id, k.secret_sha256, k.revoked_at, k.kind,
             u.id AS user_id, u.email, u.role, u.disabled_at AS user_disabled_at
        FROM api_keys k
        JOIN users u ON u.id = k.user_id
@@ -191,6 +202,13 @@ export async function resolveApiKey(db: Db, presented: string): Promise<ResolveR
       role: row.role,
       apiKeyId: row.id,
       keyId: row.key_id,
+      /**
+       * Defaulted defensively although the column is NOT NULL with a default, because this
+       * mapping runs on every single /mcp call and an unexpected value here would make the
+       * audit actor wrong rather than loudly broken. 'standard' is the safe reading: it
+       * claims less.
+       */
+      kind: row.kind === 'chat' ? 'chat' : 'standard',
     },
   };
 }

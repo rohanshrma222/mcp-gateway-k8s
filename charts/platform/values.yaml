@@ -308,6 +308,20 @@ secrets:
   jwtExistingSecret: ''
   encryptionExistingSecret: ''
   groqExistingSecret: ''
+
+  # The model API key itself, for a local deployment where there is no external secret
+  # manager. Left empty by default, which disables the chat agent and nothing else.
+  #
+  # Supplying it here means it lands in a values file, so it is NOT the production path -
+  # values-prod.yaml uses groqExistingSecret and the README's k3s runbook says to create
+  # that Secret with kubectl so the key never enters the repository. For local work the
+  # tradeoff is different: a key pasted into values-local.yaml is gitignored and the
+  # cluster is on a laptop.
+  #
+  # Pass it on the command line to keep it out of files entirely:
+  #   helm upgrade --install platform charts/platform -f charts/platform/values-local.yaml \
+  #     --set secrets.groqApiKey=gsk_...
+  groqApiKey: ''
   bootstrapExistingSecret: ''
 
 # ---------------------------------------------------------------- networkpolicy
@@ -329,6 +343,40 @@ networkPolicy:
   upstreamNamespaces:
     - store-default
     - mcp-upstreams
+
+# The in-dashboard chat agent (stage 8).
+#
+# Everything here has a working default; only the key in `secrets` above is required, and
+# without it these values are inert. The agent connects to the gateway's own /mcp endpoint
+# with an ephemeral per-request API key, so it has exactly the permissions of the user
+# driving it - see services/gateway/src/chat/ephemeralKey.ts.
+chat:
+  # Pinned rather than an alias like "latest", so the model behind a tool-calling agent
+  # cannot change underneath it.
+  #
+  # And the maintenance cost this comment predicted arrived immediately: the first value
+  # here was llama-3.3-70b-versatile, which Groq had already retired, so every chat request
+  # failed with a 404 naming the model. Worth keeping as a note rather than quietly editing,
+  # because it is the argument for reading the provider error body - "the provider returned
+  # 404" alone would have sent me looking at my own request shape.
+  #
+  # Chosen from what the account can actually see. Of the 11 models available, most are
+  # speech (whisper, orpheus) or classifiers (llama-prompt-guard); the tool-calling
+  # candidates are openai/gpt-oss-120b, openai/gpt-oss-20b and qwen/qwen3.8-27b. The 120b
+  # is the most capable at choosing between 21 similarly-named tools, which is this agents
+  # whole job.
+  #
+  # Check what your key can see before changing it:
+  #   curl -H "Authorization: Bearer $GROQ_API_KEY" https://api.groq.com/openai/v1/models
+  model: openai/gpt-oss-120b
+
+  # How many model turns may make tool calls before the loop gives up and says so. Enough
+  # for the brief's two-upstream prompt with room to recover from a failing tool twice.
+  maxIterations: 8
+
+  # A whole streamed turn, not one tool call. Generous, because a model writing a long
+  # answer is legitimately slow in a way an upstream call is not.
+  modelTimeoutSeconds: 60
 
 metrics:
   # prom-client /metrics on the gateway. No Ingress path: metrics are scraped in-cluster,

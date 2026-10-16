@@ -79,7 +79,8 @@ spec:
     # work, and the namespaces listed hold only MCP servers.
     #
     # Note what this still forbids, which is the point: the gateway cannot reach the
-    # public internet, the Kubernetes API, or any other namespace. The SSRF guard in 4.6
+    # Kubernetes API or any other namespace, and - unless the chat agent is configured
+    # below - cannot reach the public internet either. The SSRF guard in 4.6
     # inspects a candidate URL before it is ever stored; this is the layer that holds when
     # the guard is wrong, because a URL that passes validation and resolves somewhere
     # unexpected still has to get past the dataplane.
@@ -88,5 +89,49 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
+    {{/*
+    The model provider, and ONLY when the chat agent is actually configured.
+
+    This rule exists because step 8.1 was blocked by this very policy. The chat agent has
+    to reach api.groq.com, the gateway had no internet egress at all, and the first four
+    chat requests failed with "could not reach the model provider: fetch failed" - the
+    hardening from stand-out #6 catching a feature added two stages later. A good outcome:
+    the default was deny, so the hole had to be argued for rather than being there already.
+
+    **Why a CIDR and not a hostname.** NetworkPolicy matches IP addresses, not DNS names.
+    api.groq.com sits behind a CDN, so its addresses change without notice and pinning them
+    would break silently. There is no narrower selector available in the API.
+
+    **So the rule is "the public internet, and nothing private".** 443/TCP to 0.0.0.0/0
+    with every private range excepted: RFC1918, loopback, link-local - which includes
+    169.254.169.254, the cloud metadata endpoint - and the CGNAT range. That is the same
+    set the SSRF guard rejects at the application layer in 4.6, now mirrored in the
+    dataplane, so the two layers agree about what "internal" means and either one holding
+    is enough.
+
+    **What it costs, stated plainly.** The gateway can now open an outbound TLS connection
+    to any public host. That is a real widening and it is the price of an LLM feature with
+    a hosted provider; the alternative is a self-hosted model, which this assignment does
+    not have the hardware for. What it does NOT allow is anything inside the cluster or on
+    any private network, which is what an SSRF would be reaching for.
+
+    Conditional on the chat being configured, so a deployment without a model key keeps the
+    stricter posture. The feature and its hole arrive together and leave together.
+    */}}
+    {{- if include "platform.gateway.chatEnabled" . }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
     {{- end }}
 {{- end }}

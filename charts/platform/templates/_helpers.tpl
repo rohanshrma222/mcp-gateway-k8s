@@ -47,6 +47,38 @@ the other, and `values-prod.yaml` can point each at a different externally manag
 {{- end -}}
 {{- end -}}
 
+{{/*
+The Secret holding the model API key for the chat agent.
+
+Unlike every other Secret this chart manages, this one cannot be generated. A JWT signing
+key and an encryption key are just random bytes, so the chart makes them with
+`common.secretValue` and nobody ever has to see them. A Groq API key is issued by Groq and
+has to be brought in from outside, which changes what the chart can offer: it can carry a
+value the operator supplies, or point at a Secret somebody else manages, and it cannot
+invent one.
+
+So this helper has no generated branch, and the chat agent is optional throughout -
+`config.ts` makes GROQ_API_KEY the only optional secret in the schema, and the deployment
+below only sets the variable when there is something to set it to.
+*/}}
+{{- define "platform.gateway.groqSecretName" -}}
+{{- if .Values.secrets.groqExistingSecret -}}
+{{- .Values.secrets.groqExistingSecret -}}
+{{- else -}}
+{{- printf "%s-groq" (include "common.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the chat agent has a key at all, from either source.
+
+Used in three places - the Secret, the env var and the checksum annotation - so the
+condition lives here rather than being repeated and drifting.
+*/}}
+{{- define "platform.gateway.chatEnabled" -}}
+{{- if or .Values.secrets.groqExistingSecret .Values.secrets.groqApiKey -}}true{{- end -}}
+{{- end -}}
+
 {{- define "platform.bootstrapSecretName" -}}
 {{- if .Values.secrets.bootstrapExistingSecret -}}
 {{- .Values.secrets.bootstrapExistingSecret -}}

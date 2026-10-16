@@ -422,9 +422,14 @@ export class ClientPool {
     });
 
     try {
-      // The SDK's connect performs the `initialize` handshake, so a successful return
-      // means the upstream is genuinely speaking MCP - not merely that a TCP connection
-      // opened. That distinction is why this is the status signal rather than a ping.
+      // NOTE: this comment used to claim that connect performs the `initialize` handshake,
+      // so that a successful return proved the upstream was genuinely speaking MCP. That is
+      // NOT true for Streamable HTTP, and the `proven` flag further up this file exists
+      // because of it - measured in 6.4, where a Service with zero endpoints connected
+      // happily and then hung on the first real request. The two comments contradicted each
+      // other in the same file for two steps; this is the one that matches the transport.
+      // Connect still has to be wrapped, because a malformed URL or an immediately refused
+      // connection does fail here.
       // Cast at the SDK boundary, the mirror image of the one in woo-mcp. The transport
       // declares `sessionId?: string | undefined` while the Transport interface declares
       // `sessionId?: string`, so under exactOptionalPropertyTypes the SDK class does not

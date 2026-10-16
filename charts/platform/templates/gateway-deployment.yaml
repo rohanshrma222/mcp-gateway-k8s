@@ -119,6 +119,54 @@ spec:
               value: {{ .Values.gateway.upstreamProbeTimeoutMs | quote }}
             - name: METRICS_ENABLED
               value: {{ .Values.metrics.enabled | quote }}
+
+            {{/*
+            The chat agent.
+
+            The key is the only env var here that is conditional, and the condition is the
+            point: with no key the variable is absent, the gateway's config schema accepts
+            that because GROQ_API_KEY is optional, and POST /api/chat answers 503 with a
+            sentence saying the deployment has no model key. The alternative - always
+            setting it, from a Secret that may not exist - makes the pod fail to start with
+            a CreateContainerConfigError, which takes the whole platform down because one
+            optional feature was not configured.
+            */}}
+            {{- if include "platform.gateway.chatEnabled" . }}
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "platform.gateway.groqSecretName" . }}
+                  key: groq-api-key
+            {{- end }}
+            - name: GROQ_MODEL
+              value: {{ .Values.chat.model | quote }}
+            - name: CHAT_MAX_ITERATIONS
+              value: {{ .Values.chat.maxIterations | quote }}
+            - name: CHAT_MODEL_TIMEOUT_MS
+              value: {{ mul .Values.chat.modelTimeoutSeconds 1000 | quote }}
+            {{/*
+            The agent reaches the gateway's own /mcp over loopback, so this follows PORT
+            rather than the Service name. See the note at the top of chat/agent.ts: routing
+            through the Service could land the call on the other replica and make one chat
+            depend on two pods being healthy.
+            */}}
+            {{/*
+            Built from the SAME expression as PORT above, deliberately.
+
+            The first version of this line used `.Values.gateway.port`, which does not
+            exist - the port lives in `gateway.ports[0].containerPort` - so it rendered
+            `http://127.0.0.1:/mcp` and the gateway refused to start with
+            "CHAT_SELF_MCP_URL: Invalid URL". The config schema's fail-fast caught it in
+            about four seconds, which is the behaviour 4.2 was built for and the first time
+            it has caught something real.
+
+            Reusing the identical expression rather than repeating the number is what stops
+            the two from drifting: if the container port changes, the agent follows it, and
+            a mismatch here would mean the gateway could not call itself while every other
+            thing about it looked healthy.
+            */}}
+            - name: CHAT_SELF_MCP_URL
+              value: {{ printf "http://127.0.0.1:%v/mcp" (first .Values.gateway.ports).containerPort | quote }}
           volumeMounts:
             # The root filesystem is read-only, so anything needing a scratch path gets a
             # named volume. Node writes nothing itself; this exists for the OS temp

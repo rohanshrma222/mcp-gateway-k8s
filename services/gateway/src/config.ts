@@ -120,6 +120,54 @@ const schema = z.object({
     .enum(['true', 'false'])
     .default('true')
     .transform((value) => value === 'true'),
+
+  /**
+   * The chat agent's model key. OPTIONAL, and that is a decision rather than an oversight.
+   *
+   * Every other secret in this schema is required, because the gateway cannot do its job
+   * without a database, a JWT secret or an encryption key. The model key is different: the
+   * store, the three upstreams, `/mcp`, the dashboard, the registry and the audit log all
+   * work without it. Making it required would mean a deployment with no LLM budget cannot
+   * run the platform at all, and a boot failure is a much worse way to learn that a key is
+   * missing than a 503 from one endpoint saying so.
+   */
+  GROQ_API_KEY: z.string().min(1).optional(),
+
+  /**
+   * Pinned by default rather than left to the provider's idea of "latest".
+   *
+   * A model id that silently changes underneath a tool-calling agent changes how well it
+   * calls tools, which would look like our bug. Overridable, because Groq retires model
+   * ids on its own schedule and a pinned default will eventually be the thing that breaks.
+   */
+  GROQ_MODEL: z.string().min(1).default('openai/gpt-oss-120b'),
+
+  GROQ_BASE_URL: z.string().url().default('https://api.groq.com/openai/v1'),
+
+  /** A whole streamed turn, not a single tool call. See GroqOptions.timeoutMs. */
+  CHAT_MODEL_TIMEOUT_MS: z.coerce.number().int().min(1000).max(300_000).default(60_000),
+
+  /**
+   * How many model turns may make tool calls before the loop stops.
+   *
+   * Eight is enough for the multi-upstream prompt the brief asks for - "summarise today's
+   * orders and save a note" is three or four - with room for the model to recover from a
+   * failing tool once or twice. The cap exists because a model that cannot satisfy a
+   * request will cheerfully keep calling the same tool, and the cost of that is real money
+   * and real audit rows.
+   */
+  CHAT_MAX_ITERATIONS: z.coerce.number().int().min(1).max(20).default(8),
+
+  /**
+   * The gateway's own MCP endpoint, as the chat agent reaches it.
+   *
+   * Loopback by default so one chat stays inside one pod - see the note at the top of
+   * `chat/agent.ts`. It is configurable rather than hardcoded because the port is
+   * configurable, and a hardcoded 3000 here would break silently the moment PORT changed:
+   * the agent would fail to connect and the chat would report a gateway problem that was
+   * actually a mismatched constant.
+   */
+  CHAT_SELF_MCP_URL: z.string().url().default('http://127.0.0.1:3000/mcp'),
 });
 
 export type Config = z.infer<typeof schema>;

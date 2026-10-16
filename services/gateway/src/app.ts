@@ -21,6 +21,9 @@ import { mcpRoutes } from './routes/mcp.js';
 import { serverRoutes } from './routes/servers.js';
 import { toolRoutes } from './routes/tools.js';
 import { auditRoutes } from './routes/audit.js';
+import { chatRoutes } from './routes/chat.js';
+import { GroqProvider } from './llm/groq.js';
+import { buildSystemPrompt } from './chat/prompt.js';
 import type { Config } from './config.js';
 import { pingDb, type Db } from './db.js';
 import type { Logger } from './logger.js';
@@ -126,6 +129,44 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
 
   await app.register(toolRoutes({ db, requireAuth: requireAuth as never }));
   await app.register(auditRoutes({ db, requireAuth: requireAuth as never }));
+
+  /**
+   * The chat agent.
+   *
+   * The provider is built once at startup rather than per request, so a missing key is
+   * discovered here and reported by the route as a 503 - see the note on
+   * `ChatRouteDeps.provider` for why a missing model key does not stop the gateway
+   * booting. Logged either way, because "chat silently does nothing" is a bad thing to have
+   * to diagnose from the outside.
+   */
+  const chatProvider =
+    config.GROQ_API_KEY === undefined
+      ? undefined
+      : new GroqProvider({
+          apiKey: config.GROQ_API_KEY,
+          model: config.GROQ_MODEL,
+          baseUrl: config.GROQ_BASE_URL,
+          timeoutMs: config.CHAT_MODEL_TIMEOUT_MS,
+        });
+
+  if (chatProvider === undefined) {
+    logger.warn(
+      "GROQ_API_KEY is not set: POST /api/chat will answer 503 and the rest of the gateway is unaffected",
+    );
+  } else {
+    logger.info({ model: config.GROQ_MODEL }, "chat agent enabled");
+  }
+
+  await app.register(
+    chatRoutes({
+      db,
+      config,
+      logger,
+      requireAuth: requireAuth as never,
+      provider: chatProvider,
+      systemPrompt: buildSystemPrompt({ userEmail: "the signed-in user", role: "as recorded" }),
+    }),
+  );
 
   // The machine door. A completely separate resolver from the session middleware above:
   // different credential, different lifetime, different revocation story. Sharing one

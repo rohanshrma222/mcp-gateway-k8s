@@ -59,7 +59,16 @@ export function mcpRoutes(deps: McpRouteDeps) {
          * unarguable: the row carries the real user, and the actor column records only
          * which door they came through.
          */
-        actor: "external",
+        /**
+         * Derived from the key, never from the request.
+         *
+         * Until 8.1 this was the literal "external", which was true because the chat agent
+         * did not exist yet. It is now read off the principal, which `resolveApiKey` read
+         * out of the database - so a chat call is recorded as chat because the gateway
+         * minted that key and marked it, not because the caller said so. Migration 007 has
+         * the argument for why a header would have been forgeable.
+         */
+        actor: principal.kind === "chat" ? "chat" : "external",
       });
 
       // sessionIdGenerator is OMITTED rather than set to undefined - the same distinction
