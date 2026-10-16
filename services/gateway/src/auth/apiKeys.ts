@@ -126,7 +126,7 @@ export interface ApiKeyPrincipal {
   kind: ApiKeyKind;
 }
 
-export type ResolveFailure = 'malformed' | 'unknown' | 'revoked' | 'user-disabled';
+export type ResolveFailure = 'malformed' | 'unknown' | 'revoked' | 'user-disabled' | 'expired';
 
 export type ResolveResult =
   | { ok: true; principal: ApiKeyPrincipal }
@@ -154,13 +154,14 @@ export async function resolveApiKey(db: Db, presented: string): Promise<ResolveR
     key_id: string;
     secret_sha256: string;
     revoked_at: Date | null;
+    expires_at: Date | null;
     user_id: string;
     email: string;
     role: Role;
     kind: string;
     user_disabled_at: Date | null;
   }>(
-    `SELECT k.id, k.key_id, k.secret_sha256, k.revoked_at, k.kind,
+    `SELECT k.id, k.key_id, k.secret_sha256, k.revoked_at, k.kind, k.expires_at,
             u.id AS user_id, u.email, u.role, u.disabled_at AS user_disabled_at
        FROM api_keys k
        JOIN users u ON u.id = k.user_id
@@ -190,6 +191,29 @@ export async function resolveApiKey(db: Db, presented: string): Promise<ResolveR
   // Order matters for the message, not for the outcome: both fail. Revocation is checked
   // first because it is the more specific and more actionable fact for the caller.
   if (row.revoked_at !== null) return { ok: false, reason: 'revoked' };
+
+  /**
+   * Expiry is enforced HERE, on the path every call already takes - not in the sweeper.
+   *
+   * 8.1 bounded a chat key's life to one request by revoking it in a `finally`, and named
+   * the gap: a pod killed mid-chat never runs that `finally` and leaves a live credential.
+   * Migration 008 adds the expiry; this line is what makes it a control rather than a
+   * record. An orphaned key stops working the moment it expires whether or not any
+   * background job is alive, which is the property that matters - a cleanup job that can
+   * crash without anyone noticing cannot be the thing standing between a leaked credential
+   * and the tool-call path.
+   *
+   * NULL means never expires, which is every key issued through the dashboard. See the
+   * migration for why that is deliberate rather than an omission.
+   *
+   * Reported as its own reason rather than folded into 'revoked', because the two mean
+   * different things to whoever is reading a log: 'revoked' is somebody's decision, while
+   * 'expired' on a chat key means a request died without cleaning up - which is a signal
+   * about the deployment, not about the user.
+   */
+  if (row.expires_at !== null && row.expires_at.getTime() <= Date.now()) {
+    return { ok: false, reason: 'expired' };
+  }
   if (row.user_disabled_at !== null) return { ok: false, reason: 'user-disabled' };
 
   return {

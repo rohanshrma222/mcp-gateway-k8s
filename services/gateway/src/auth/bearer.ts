@@ -35,6 +35,17 @@ const FAILURE_MESSAGES: Record<ResolveFailure, string> = {
   unknown: 'unknown or invalid API key',
   revoked: 'this API key has been revoked',
   'user-disabled': 'the account this API key belongs to is disabled',
+  /**
+   * Chat keys are the only keys that expire today, and an expired one means the chat
+   * request that minted it died before it could clean up - a rollout, an OOM, an eviction.
+   *
+   * Worded for the realistic reader. A human will almost never see this: the dashboard
+   * mints a chat key, uses it and revokes it within about a second, so the only way to
+   * present an expired key is to have captured one. Somebody doing that is either
+   * debugging or probing, and either way "it expired, mint a new one" is both true and
+   * useless to an attacker.
+   */
+  expired: 'this API key has expired; ephemeral chat keys are valid only for the request that created them',
 };
 
 export interface BearerDeps {

@@ -168,6 +168,30 @@ const schema = z.object({
    * actually a mismatched constant.
    */
   CHAT_SELF_MCP_URL: z.string().url().default('http://127.0.0.1:3000/mcp'),
+
+  /**
+   * How long an ephemeral chat key stays valid (8.4). OPTIONAL and normally unset.
+   *
+   * Left undefined, it is derived by `chatKeyTtlMs` from CHAT_MAX_ITERATIONS and
+   * CHAT_MODEL_TIMEOUT_MS, because the real constraint is that it must outlast the longest
+   * legitimate turn - a key expiring underneath a long answer would fail with an auth error
+   * halfway through, intermittently, depending on how talkative the model was. A derived
+   * value cannot drift when somebody raises the iteration cap without thinking about key
+   * expiry, which they would, and should not have to.
+   *
+   * Set it to override for a deployment where that formula is wrong.
+   */
+  CHAT_KEY_TTL_MS: z.coerce.number().int().min(10_000).max(3_600_000).optional(),
+
+  /**
+   * How often the sweeper looks for expired chat keys that were never revoked.
+   *
+   * Not the enforcement interval - expiry is checked on every call in `resolveApiKey`, so
+   * this only decides how quickly the keys table stops listing a dead key as outstanding.
+   * A minute is frequent enough that an operator reading the Keys page after a deploy sees
+   * the truth, and infrequent enough to be invisible.
+   */
+  CHAT_KEY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(5_000).max(3_600_000).default(60_000),
 });
 
 export type Config = z.infer<typeof schema>;

@@ -42,12 +42,30 @@ export async function mintChatKey(
   db: Db,
   userId: string,
   logger: Logger,
+  /**
+   * How long the key stays valid if this request never gets to revoke it (8.4).
+   *
+   * The normal path still revokes in a `finally` within a second or two - measured median
+   * 0.83s - so this is not the expected lifetime, it is the ceiling for an abandoned one.
+   * See `chatKeyTtlMs` for why the value is derived from the iteration cap and the model
+   * timeout rather than chosen.
+   */
+  ttlMs: number,
 ): Promise<EphemeralKey> {
   const issued = generateKey();
 
   const { rows } = await db.query<{ id: string }>(
-    `INSERT INTO api_keys (key_id, user_id, name, secret_sha256, kind)
-     VALUES ($1, $2, $3, $4, 'chat')
+    /**
+     * The expiry is computed by Postgres, not by Node.
+     *
+     * `now() + interval` rather than passing a JavaScript `Date`, so the value is relative
+     * to the same clock that `resolveApiKey` compares it against and that the sweeper reads.
+     * Two gateway replicas with slightly different clocks would otherwise mint keys whose
+     * lifetimes disagree with the database's idea of now - a small skew, and the kind that
+     * produces an expiry bug nobody can reproduce.
+     */
+    `INSERT INTO api_keys (key_id, user_id, name, secret_sha256, kind, expires_at)
+     VALUES ($1, $2, $3, $4, 'chat', now() + ($5::bigint * interval '1 millisecond'))
      RETURNING id`,
     [
       issued.keyId,
@@ -66,6 +84,7 @@ export async function mintChatKey(
        * the dashboard path on how a key is stored - there is one implementation.
        */
       issued.secretSha256,
+      ttlMs,
     ],
   );
 
@@ -77,7 +96,7 @@ export async function mintChatKey(
     throw new Error('minting a chat key returned no row');
   }
 
-  logger.debug({ userId, keyId: issued.keyId }, 'minted an ephemeral chat key');
+  logger.debug({ userId, keyId: issued.keyId, ttlMs }, 'minted an ephemeral chat key');
 
   return { presented: issued.plaintext, keyId: issued.keyId, apiKeyId: row.id };
 }

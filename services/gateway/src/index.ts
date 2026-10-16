@@ -13,6 +13,7 @@ import { createLogger } from './logger.js';
 import { createMetrics } from './metrics.js';
 import { ClientPool } from './mcp/pool.js';
 import { HealthProber } from './mcp/prober.js';
+import { ChatKeySweeper } from './chat/keySweeper.js';
 import { initDummyHash } from './auth/passwords.js';
 
 // Exits non-zero with the offending field names if anything is missing or malformed.
@@ -49,6 +50,26 @@ const prober = new HealthProber({
   probeTimeoutMs: config.UPSTREAM_PROBE_TIMEOUT_MS,
 });
 
+/**
+ * The chat key sweeper (8.4).
+ *
+ * A separate interval from the prober rather than extra work in its cycle, because the
+ * two have nothing to do with each other and sharing a timer would couple their
+ * failures: a slow probe cycle would delay key cleanup, and 6.6 already had to add a
+ * freshness metric because a stalled prober is hard to notice from outside. Two cheap
+ * intervals are easier to reason about than one cycle doing two jobs.
+ *
+ * This is cleanup, not enforcement - expiry is checked in `resolveApiKey` on every
+ * call - so if it never ran, no credential would be usable that is not usable now. The
+ * file header has the argument for why that separation is the important part.
+ */
+const keySweeper = new ChatKeySweeper({
+  db,
+  logger,
+  metrics,
+  intervalMs: config.CHAT_KEY_SWEEP_INTERVAL_MS,
+});
+
 
 /**
  * Note what is NOT done here: no connection to Postgres is attempted before listening.
@@ -77,6 +98,7 @@ async function main(): Promise<void> {
   await app.listen({ host: '0.0.0.0', port: config.PORT });
 
   prober.start();
+  keySweeper.start();
 
   logger.info(
     {
@@ -122,6 +144,10 @@ async function shutdown(signal: string): Promise<void> {
     // leaving it running during the drain would have it opening upstream connections
     // while closeAll is trying to close them.
     prober.stop();
+    // The sweeper stops with the prober and for the same reason: it holds no request, so
+    // there is nothing to drain, and leaving it running would have it writing to the
+    // database while the pool is being closed.
+    keySweeper.stop();
     if (appRef !== undefined) await appRef.close();
     // Upstream connections close after the HTTP server stops accepting work and before
     // the database pool drains: an in-flight tool call still needs both, and closing

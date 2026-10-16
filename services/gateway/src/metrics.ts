@@ -39,6 +39,7 @@ export interface Metrics {
   auditWriteFailures: Counter<string>;
   upstreamTools: Gauge<'server'>;
   probeCycleCompleted: Gauge<string>;
+  chatKeysSwept: Counter<string>;
 }
 
 export function createMetrics(enabled: boolean): Metrics {
@@ -100,6 +101,27 @@ export function createMetrics(enabled: boolean): Metrics {
    * same incident class and wants the same response - and a label here would be one more
    * place for caller-controlled text to reach the metric namespace.
    */
+  /**
+   * Ephemeral chat keys the sweeper had to revoke because their request never did (8.4).
+   *
+   * **A counter that should stay at zero**, and that is what makes it worth having. The
+   * normal path revokes a chat key in a `finally` within about a second - measured median
+   * 0.83s - so a key reaching the sweeper means its request died first: a pod killed by a
+   * rollout, an OOM, a node eviction. This is therefore not a throughput metric but an
+   * incident signal, and a steadily climbing value says chat requests are being
+   * interrupted rather than that the sweeper is busy.
+   *
+   * No label. A key id would be high-cardinality text from close to the caller living in
+   * the metric namespace, which is the same objection as
+   * `mcp_audit_write_failures_total`. The sweeper logs the ids at warn level, which is
+   * where to look once this moves.
+   */
+  const chatKeysSwept = new Counter({
+    name: 'mcp_chat_keys_swept_total',
+    help: 'Expired ephemeral chat keys revoked by the sweeper because their request did not clean up',
+    registers: [registry],
+  });
+
   const auditWriteFailures = new Counter({
     name: 'mcp_audit_write_failures_total',
     help: 'Tool calls that completed but could not be written to the audit log',
@@ -154,6 +176,7 @@ export function createMetrics(enabled: boolean): Metrics {
     upstreamUp,
     auditWriteFailures,
     upstreamTools,
+    chatKeysSwept,
     probeCycleCompleted,
   };
 }

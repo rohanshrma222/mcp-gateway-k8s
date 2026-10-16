@@ -145,6 +145,21 @@ spec:
             - name: CHAT_MODEL_TIMEOUT_MS
               value: {{ mul .Values.chat.modelTimeoutSeconds 1000 | quote }}
             {{/*
+            How often the sweeper tidies expired chat keys (8.4).
+
+            Note what this is NOT: the enforcement interval. An expired key is rejected by
+            resolveApiKey on every call, so this only decides how quickly the keys table
+            stops listing a dead key as outstanding. A crashed sweeper costs tidiness, not
+            security - which is the whole reason the check lives on the request path.
+
+            The TTL itself is deliberately not set here. config.ts derives it from
+            CHAT_MAX_ITERATIONS and CHAT_MODEL_TIMEOUT_MS, because it has to outlast the
+            longest legitimate turn and a hand-set number would drift the moment somebody
+            raised the iteration cap.
+            */}}
+            - name: CHAT_KEY_SWEEP_INTERVAL_MS
+              value: {{ mul .Values.chat.keySweepIntervalSeconds 1000 | quote }}
+            {{/*
             The agent reaches the gateway's own /mcp over loopback, so this follows PORT
             rather than the Service name. See the note at the top of chat/agent.ts: routing
             through the Service could land the call on the other replica and make one chat

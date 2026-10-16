@@ -378,6 +378,18 @@ chat:
   # answer is legitimately slow in a way an upstream call is not.
   modelTimeoutSeconds: 60
 
+  # How often to sweep ephemeral chat keys whose request died before revoking them (8.4).
+  #
+  # Cleanup only. An expired key is already rejected on every call, so this interval decides
+  # how quickly the Keys page stops showing a dead key as outstanding - not whether the key
+  # works. A minute is frequent enough to be truthful after a deploy and infrequent enough
+  # to be invisible.
+  #
+  # The key TTL is not configured here on purpose: the gateway derives it from maxIterations
+  # and modelTimeoutSeconds, because it must outlast the longest possible turn. Override with
+  # CHAT_KEY_TTL_MS only if that formula is wrong for your deployment.
+  keySweepIntervalSeconds: 60
+
 metrics:
   # prom-client /metrics on the gateway. No Ingress path: metrics are scraped in-cluster,
   # and exposing them publicly would leak tool names, user counts and failure rates.

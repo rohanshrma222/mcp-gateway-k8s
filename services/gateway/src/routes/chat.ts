@@ -23,6 +23,7 @@ import type { LlmMessage, LlmProvider } from '../llm/provider.js';
 import { LlmError } from '../llm/provider.js';
 import { runAgent, type AgentEvent } from '../chat/agent.js';
 import { mintChatKey, revokeChatKey } from '../chat/ephemeralKey.js';
+import { chatKeyTtlMs } from '../chat/keySweeper.js';
 
 export interface ChatRouteDeps {
   db: Db;
@@ -144,7 +145,12 @@ export function chatRoutes(deps: ChatRouteDeps): FastifyPluginAsync {
         if (!reply.raw.writableEnded) controller.abort();
       });
 
-      const key = await mintChatKey(deps.db, principal.userId, deps.logger);
+      const key = await mintChatKey(
+        deps.db,
+        principal.userId,
+        deps.logger,
+        chatKeyTtlMs(deps.config),
+      );
       const startedAt = Date.now();
 
       try {
