@@ -12,6 +12,7 @@
  * middle of the app - and the role filtering in Shell.tsx is only verifiable if the links
  * go somewhere.
  */
+import { useEffect, useState } from 'react';
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { SessionProvider, useSession } from './auth/session.js';
@@ -19,6 +20,7 @@ import { Login } from './routes/Login.js';
 import { Shell } from './routes/Shell.js';
 import { Servers } from './routes/Servers.js';
 import { Audit } from './routes/Audit.js';
+import { Tools } from './routes/Tools.js';
 import { Members } from './routes/Members.js';
 import { Keys } from './routes/Keys.js';
 
@@ -59,7 +61,7 @@ function Tree() {
    * there is deliberately no spinner: at this duration a spinner appears and vanishes,
    * which is more distracting than nothing.
    */
-  if (loading) return <div className="min-h-dvh" />;
+  if (loading) return <StartupHold />;
 
   if (session === undefined) {
     return (
@@ -76,7 +78,7 @@ function Tree() {
             use, rather than a shared landing page that would be empty for one of them. */}
         <Route index element={<Navigate to={session.role === 'admin' ? '/servers' : '/tools'} replace />} />
         <Route path="servers" element={<Servers />} />
-        <Route path="tools" element={<Pending title="Tools" step="7.2" />} />
+        <Route path="tools" element={<Tools />} />
         <Route path="members" element={<Members />} />
         <Route path="keys" element={<Keys />} />
         <Route path="audit" element={<Audit />} />
@@ -95,6 +97,47 @@ function Tree() {
  * Honest rather than decorative: "coming soon" tells a reviewer nothing, while naming the
  * step means the roadmap in docs/implementation.md and the running app agree.
  */
+/**
+ * The hold while the first `me()` call settles - blank, but only briefly.
+ *
+ * The blank is deliberate and explained in `Tree`: showing the login form for the few
+ * hundred milliseconds that call takes means every page load of a signed-in user flashes a
+ * login screen, and a spinner at that duration appears and vanishes, which is worse than
+ * nothing.
+ *
+ * What 7.5's audit found is that the blank was **unbounded**. If the gateway is unreachable
+ * the request hangs until the browser gives up - which can be tens of seconds - and the user
+ * stares at an empty black page with no indication that anything is wrong or that anything is
+ * happening. That is precisely the blank screen this step exists to eliminate, and it was the
+ * one screen nobody had looked at because it is invisible whenever the system is healthy.
+ *
+ * So after a second and a half - long past the point where a fast answer would have arrived,
+ * and long before a human concludes the page is broken - it says what it is waiting for.
+ */
+function StartupHold() {
+  const [slow, setSlow] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setSlow(true), 1500);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  if (!slow) return <div className="min-h-dvh" />;
+
+  return (
+    <main className="flex min-h-dvh items-center justify-center px-4">
+      <div className="max-w-sm text-center">
+        <p className="text-sm text-ink-300">Checking your session…</p>
+        <p className="mt-2 text-xs leading-relaxed text-ink-500">
+          This is taking longer than usual. The dashboard is served separately from the API, so
+          this page loading while the check hangs means the gateway specifically is slow or
+          unreachable — it may be restarting.
+        </p>
+      </div>
+    </main>
+  );
+}
+
 function Pending({ title, step }: { title: string; step: string }) {
   return (
     <section>

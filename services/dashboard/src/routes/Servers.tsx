@@ -14,6 +14,7 @@ import { useResource } from '../hooks/useResource.js';
 import { Button } from '../components/Button.js';
 import { Dialog } from '../components/Dialog.js';
 import { StatusChip, StatusReason, relativeTime } from '../components/StatusChip.js';
+import { EmptyState, ErrorState, LoadingRows, StaleBanner } from '../components/states.js';
 import { ServerForm } from '../components/ServerForm.js';
 
 /**
@@ -79,14 +80,19 @@ export function Servers() {
     [refresh],
   );
 
-  if (servers.loading) return <Skeleton />;
+  if (servers.loading) return <LoadingRows rows={3} height="h-20" />;
 
   // An error with no data at all is the only case that replaces the page. Once there is
   // data, a failed refresh shows a banner and keeps the last known state - see useResource.
   if (servers.data === undefined) {
+    // `subject` is what makes the 403 branch readable: a member reaching this URL is told
+    // what the page is for and who may see it, rather than being offered a retry that
+    // cannot succeed.
     return (
-      <Problem
-        message={servers.error ?? 'Could not load upstream servers.'}
+      <ErrorState
+        error={servers.failure ?? servers.error}
+        title="Could not load servers"
+        subject="upstream servers"
         onRetry={() => void servers.reload()}
       />
     );
@@ -114,11 +120,7 @@ export function Servers() {
 
       {/* A stale-data banner rather than replacing the table. The last known statuses are
           more useful than an error page when the gateway blips for one poll. */}
-      {servers.error !== undefined && servers.data.length > 0 ? (
-        <p className="mb-4 rounded-md border border-warn-600/40 bg-warn-600/10 px-3 py-2 text-sm text-warn-500">
-          Showing the last known state — {servers.error}
-        </p>
-      ) : undefined}
+      {servers.error !== undefined && servers.data.length > 0 ? <StaleBanner error={servers.error} /> : undefined}
 
       {servers.data.length === 0 ? (
         <Empty onAdd={() => setAdding(true)} />
@@ -412,44 +414,18 @@ function Chevron({ open }: { open: boolean }) {
   );
 }
 
-function Skeleton() {
-  return (
-    <section>
-      <div className="mb-6 h-10 w-48 rounded bg-ink-900" />
-      <ul className="space-y-2">
-        {[0, 1, 2].map((index) => (
-          // No pulse animation. A skeleton that pulses while three of them load in 80ms is
-          // motion for its own sake; the shape alone communicates "this is loading".
-          <li key={index} className="h-20 rounded-lg border border-ink-800 bg-ink-900/40" />
-        ))}
-      </ul>
-    </section>
-  );
-}
-
 function Empty({ onAdd }: { onAdd: () => void }) {
   return (
-    <div className="rounded-lg border border-dashed border-ink-700 p-8 text-center">
-      <p className="text-sm text-ink-300">No upstream servers are registered.</p>
-      <p className="mx-auto mt-1 max-w-md text-xs leading-relaxed text-ink-500">
-        The charts normally pre-register the WooCommerce server, the notes server and the
-        reference server on install, so an empty list usually means the seed Job has not run.
-      </p>
-      <Button intent="primary" className="mt-4" onClick={onAdd}>
-        Add one manually
-      </Button>
-    </div>
-  );
-}
-
-function Problem({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <div className="rounded-lg border border-bad-600/40 bg-bad-600/10 p-6">
-      <h1 className="text-base font-semibold text-ink-50">Could not load servers</h1>
-      <p className="mt-1 max-w-prose break-words text-sm text-ink-300">{message}</p>
-      <Button className="mt-4" onClick={onRetry}>
-        Try again
-      </Button>
-    </div>
+    <EmptyState
+      title="No upstream servers are registered."
+      action={
+        <Button intent="primary" onClick={onAdd}>
+          Add one manually
+        </Button>
+      }
+    >
+      The charts normally pre-register the WooCommerce server, the notes server and the
+      reference server on install, so an empty list usually means the seed Job has not run.
+    </EmptyState>
   );
 }

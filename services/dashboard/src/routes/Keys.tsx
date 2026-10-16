@@ -22,6 +22,7 @@ import { Button } from '../components/Button.js';
 import { Dialog } from '../components/Dialog.js';
 import { SecretOnce } from '../components/SecretOnce.js';
 import { relativeTime } from '../components/StatusChip.js';
+import { EmptyState, ErrorState, LoadingRows } from '../components/states.js';
 import { useSession } from '../auth/session.js';
 
 export function Keys() {
@@ -49,19 +50,17 @@ export function Keys() {
     [keys],
   );
 
-  if (keys.loading) return <Skeleton />;
+  if (keys.loading) return <LoadingRows rows={2} />;
 
   if (keys.data === undefined) {
+    // No `subject`: this page is open to every role, so a 403 here would mean something
+    // genuinely unexpected rather than a member reaching an admin page.
     return (
-      <div className="rounded-lg border border-bad-600/40 bg-bad-600/10 p-6">
-        <h1 className="text-base font-semibold text-ink-50">Could not load keys</h1>
-        <p className="mt-1 max-w-prose break-words text-sm text-ink-300">
-          {keys.error ?? 'The gateway did not answer.'}
-        </p>
-        <Button className="mt-4" onClick={() => void keys.reload()}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        error={keys.failure ?? keys.error}
+        title="Could not load keys"
+        onRetry={() => void keys.reload()}
+      />
     );
   }
 
@@ -235,7 +234,11 @@ function KeyRow({
         </span>
 
         <span className="mt-0.5 block text-xs text-ink-600">
-          {showOwner ? <span className="text-ink-500">{apiKey.ownerEmail} · </span> : undefined}
+          {/* break-all, because an email has no spaces to wrap at and the column caps at
+              320 characters. Without it a long address overflows the card rather than
+              wrapping - the metadata line is a block, so it wraps at whitespace and an
+              email offers none. Found by feeding the API an 88-character address. */}
+          {showOwner ? <span className="break-all text-ink-500">{apiKey.ownerEmail} · </span> : undefined}
           created {relativeTime(apiKey.createdAt)} ·{' '}
           {apiKey.lastUsedAt === null ? (
             // Never used is worth saying explicitly: it distinguishes a key somebody was
@@ -333,28 +336,16 @@ function IssueForm({
 
 function Empty({ onIssue }: { onIssue: () => void }) {
   return (
-    <div className="rounded-lg border border-dashed border-ink-700 p-8 text-center">
-      <p className="text-sm text-ink-300">No API keys yet.</p>
-      <p className="mx-auto mt-1 max-w-md text-xs leading-relaxed text-ink-500">
-        A key is all an external MCP client needs. It sees every tool from every enabled
-        upstream through one endpoint, and never holds an upstream&rsquo;s own credential.
-      </p>
-      <Button intent="primary" className="mt-4" onClick={onIssue}>
-        Issue your first key
-      </Button>
-    </div>
-  );
-}
-
-function Skeleton() {
-  return (
-    <section>
-      <div className="mb-6 h-10 w-48 rounded bg-ink-900" />
-      <ul className="space-y-2">
-        {[0, 1].map((index) => (
-          <li key={index} className="h-16 rounded-lg border border-ink-800 bg-ink-900/40" />
-        ))}
-      </ul>
-    </section>
+    <EmptyState
+      title="No API keys yet."
+      action={
+        <Button intent="primary" onClick={onIssue}>
+          Issue your first key
+        </Button>
+      }
+    >
+      A key is all an external MCP client needs. It sees every tool from every enabled
+      upstream through one endpoint, and never holds an upstream&rsquo;s own credential.
+    </EmptyState>
   );
 }

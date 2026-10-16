@@ -35,6 +35,16 @@ export interface Resource<T> {
   loading: boolean;
   /** Set when the most recent attempt failed. Does not clear `data`. */
   error: string | undefined;
+  /**
+   * The error object itself, alongside the message.
+   *
+   * Added in 7.5, because the string is for display and the object is for branching - and
+   * the states pass needed to branch. A 403 is not a load failure and a network failure is
+   * not a rejection, and telling them apart means reading `ApiError.status`, which a
+   * flattened message has thrown away. Keeping both is cheaper than parsing the sentence
+   * back into a status, which is the mistake decision 2.75 is about.
+   */
+  failure: unknown;
   /** True while a refresh is in flight behind existing data. */
   refreshing: boolean;
   /** Re-fetch now. Returns when it settles, so a caller can await it after a mutation. */
@@ -51,6 +61,7 @@ export function useResource<T>(
   const [loading, setLoading] = useState(enabled);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [failure, setFailure] = useState<unknown>(undefined);
 
   /**
    * The fetcher in a ref.
@@ -77,10 +88,12 @@ export function useResource<T>(
       if (generation.current !== mine) return;
       setData(next);
       setError(undefined);
+      setFailure(undefined);
     } catch (caught) {
       if (generation.current !== mine) return;
       // The data is deliberately left in place. See the note at the top.
       setError(caught instanceof Error ? caught.message : 'Something went wrong loading this.');
+      setFailure(caught);
     } finally {
       if (generation.current === mine) {
         setLoading(false);
@@ -132,5 +145,5 @@ export function useResource<T>(
     };
   }, [enabled, intervalMs, run]);
 
-  return { data, loading, error, refreshing, reload };
+  return { data, loading, error, failure, refreshing, reload };
 }

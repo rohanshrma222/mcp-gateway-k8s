@@ -48,7 +48,25 @@ const NAV: NavItem[] = [
 
 export function Shell() {
   const { session, signOut } = useSession();
-  if (session === undefined) return undefined;
+  /**
+   * Cannot happen, and handled anyway.
+   *
+   * `Tree` only renders this component when a session exists, so this is defensive. It
+   * returned `undefined` before 7.5 - a genuinely blank page if the invariant ever broke,
+   * which is the hardest kind of bug to diagnose because there is nothing on screen to
+   * suggest where to look. A sentence naming the component costs nothing and turns a blank
+   * page into a bug report.
+   */
+  if (session === undefined) {
+    return (
+      <main className="flex min-h-dvh items-center justify-center px-4">
+        <p className="max-w-sm text-center text-sm text-ink-400">
+          The application shell rendered without a session, which should not be possible.
+          Reloading the page will re-check it.
+        </p>
+      </main>
+    );
+  }
 
   const visible = NAV.filter((item) => item.roles.includes(session.role));
 

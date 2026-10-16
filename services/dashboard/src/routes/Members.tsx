@@ -21,6 +21,7 @@ import { Button } from '../components/Button.js';
 import { Dialog } from '../components/Dialog.js';
 import { SecretOnce } from '../components/SecretOnce.js';
 import { relativeTime } from '../components/StatusChip.js';
+import { EmptyState, ErrorState, LoadingRows } from '../components/states.js';
 import { useSession } from '../auth/session.js';
 
 export function Members() {
@@ -59,19 +60,38 @@ export function Members() {
     [members],
   );
 
-  if (members.loading) return <Skeleton />;
+  if (members.loading) return <LoadingRows rows={2} />;
 
   if (members.data === undefined) {
+    /**
+     * This is the page where the 403 branch matters most, because it is the one a member is
+     * most likely to reach by typing the URL - the nav hides the link, so curiosity is the
+     * only route here. Before 7.5 they got a panel headed "Could not load members", which
+     * is true of nothing: the request succeeded and the answer was no.
+     */
     return (
-      <div className="rounded-lg border border-bad-600/40 bg-bad-600/10 p-6">
-        <h1 className="text-base font-semibold text-ink-50">Could not load members</h1>
-        <p className="mt-1 max-w-prose break-words text-sm text-ink-300">
-          {members.error ?? 'The gateway did not answer.'}
-        </p>
-        <Button className="mt-4" onClick={() => void members.reload()}>
-          Try again
-        </Button>
-      </div>
+      <ErrorState
+        error={members.failure ?? members.error}
+        title="Could not load members"
+        subject="the member list"
+        onRetry={() => void members.reload()}
+      />
+    );
+  }
+
+  /**
+   * An empty member list cannot happen through the API - the seed Job creates two accounts
+   * and there is no endpoint that deletes one. It is handled anyway, because "cannot happen"
+   * is a statement about today's endpoints rather than about this component, and the cost of
+   * being wrong is a blank page on the one screen that explains who can administer the
+   * system.
+   */
+  if (members.data.length === 0) {
+    return (
+      <EmptyState title="No accounts exist." action={<Button intent="primary" onClick={() => setInviting(true)}>Invite the first member</Button>}>
+        The seed Job creates an admin and a member on install, so an empty list means it has
+        not run — check the platform release and the bootstrap Secret.
+      </EmptyState>
     );
   }
 
@@ -327,18 +347,5 @@ function InviteForm({
         </Button>
       </div>
     </form>
-  );
-}
-
-function Skeleton() {
-  return (
-    <section>
-      <div className="mb-6 h-10 w-48 rounded bg-ink-900" />
-      <ul className="space-y-2">
-        {[0, 1].map((index) => (
-          <li key={index} className="h-16 rounded-lg border border-ink-800 bg-ink-900/40" />
-        ))}
-      </ul>
-    </section>
   );
 }

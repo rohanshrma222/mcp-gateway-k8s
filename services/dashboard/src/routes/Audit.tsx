@@ -19,6 +19,7 @@ import type { AuditEntry, AuditPage, AuditSummaryBucket } from '../api/types.js'
 import { useResource } from '../hooks/useResource.js';
 import { Button } from '../components/Button.js';
 import { relativeTime } from '../components/StatusChip.js';
+import { EmptyState, ErrorState } from '../components/states.js';
 import { useSession } from '../auth/session.js';
 
 /** The four outcomes, mapped to the same vocabulary the database and the metrics use. */
@@ -179,12 +180,11 @@ export function Audit() {
       {page.loading ? (
         <TableSkeleton />
       ) : page.data === undefined ? (
-        <div className="rounded-lg border border-bad-600/40 bg-bad-600/10 p-6">
-          <p className="break-words text-sm text-ink-300">{page.error ?? 'Could not load the audit log.'}</p>
-          <Button className="mt-4" onClick={() => void page.reload()}>
-            Try again
-          </Button>
-        </div>
+        <ErrorState
+          error={page.failure ?? page.error}
+          title="Could not load the audit log"
+          onRetry={() => void page.reload()}
+        />
       ) : entries.length === 0 ? (
         <Empty hasFilters={activeCount > 0} onClear={() => setFilters(EMPTY)} />
       ) : (
@@ -227,7 +227,10 @@ function Summary({ buckets }: { buckets: AuditSummaryBucket[] | undefined }) {
   return (
     <div className="mb-5 flex flex-wrap gap-2">
       <span className="tabular rounded-md border border-ink-800 bg-ink-900/40 px-2.5 py-1 text-xs text-ink-400">
-        {total.toLocaleString()} calls
+        {/* Pluralised, because a fresh deployment with one audit row would read "1 calls".
+            Every other count in the app already did this; this one was missed because the
+            summary is the only place a count is not immediately next to its list. */}
+        {total.toLocaleString()} call{total === 1 ? '' : 's'}
       </span>
       {buckets.map((bucket) => (
         <span
@@ -496,8 +499,22 @@ function FilterLink({
  */
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
-  if (ms < 10_000) return `${(ms / 1000).toFixed(2)}s`;
-  return `${(ms / 1000).toFixed(1)}s`;
+
+  /**
+   * The precision is chosen from the ROUNDED value, not from the raw milliseconds.
+   *
+   * The first version switched on `ms < 10_000`, which meant 9,999ms took the two-decimal
+   * branch and rendered as **"10.00s"** - a value that reads as ten seconds, overstates by
+   * a millisecond under a second's worth of rounding, and sits inconsistently beside
+   * 10,000ms rendering as "10.0s". Two near-identical durations displayed differently, in
+   * a column whose entire purpose is comparison.
+   *
+   * Rounding first and then deciding makes the two agree: 9,999ms and 10,000ms both
+   * become "10.0s".
+   */
+  const seconds = ms / 1000;
+  const twoDecimals = Number(seconds.toFixed(2));
+  return twoDecimals < 10 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`;
 }
 
 function Text({
@@ -579,20 +596,13 @@ function TableSkeleton() {
 
 function Empty({ hasFilters, onClear }: { hasFilters: boolean; onClear: () => void }) {
   return (
-    <div className="rounded-lg border border-dashed border-ink-700 p-8 text-center">
-      <p className="text-sm text-ink-300">
-        {hasFilters ? 'No calls match these filters.' : 'No tool calls have been made yet.'}
-      </p>
-      <p className="mx-auto mt-1 max-w-md text-xs leading-relaxed text-ink-500">
-        {hasFilters
-          ? 'The log is append-only, so a filter returning nothing means nothing matched — not that something was removed.'
-          : 'Connect an MCP client to /mcp with an API key and call a tool; every call lands here, attributed to the key’s owner.'}
-      </p>
-      {hasFilters ? (
-        <Button className="mt-4" onClick={onClear}>
-          Clear filters
-        </Button>
-      ) : undefined}
-    </div>
+    <EmptyState
+      title={hasFilters ? 'No calls match these filters.' : 'No tool calls have been made yet.'}
+      action={hasFilters ? <Button onClick={onClear}>Clear filters</Button> : undefined}
+    >
+      {hasFilters
+        ? 'The log is append-only, so a filter returning nothing means nothing matched — not that something was removed.'
+        : 'Connect an MCP client to /mcp with an API key and call a tool; every call lands here, attributed to the key’s owner.'}
+    </EmptyState>
   );
 }
