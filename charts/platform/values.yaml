@@ -137,6 +137,23 @@ gateway:
   rateLimit:
     enabled: true
     requestsPerMinute: 120
+
+  # Seconds to keep serving after Kubernetes decides to stop this pod (9.3).
+  #
+  # SIGTERM and endpoint removal are concurrent, so without this the ingress keeps routing to
+  # a pod that has already begun draining. Measured before it existed: a rolling restart
+  # under load dropped 3 of 276 requests. Must stay well below the 30s termination grace
+  # period, which covers this delay AND the drain after it.
+  preStopDelaySeconds: 5
+
+  # How strictly the replicas must land on different nodes (9.3).
+  #
+  # ScheduleAnyway by default because it is safe everywhere, including a single-node VPS where
+  # DoNotSchedule would leave the second replica Pending forever. The measured cost of the
+  # soft version: on a three-node cluster both gateway pods landed on the same worker, so they
+  # survived a pod failure and would not have survived a node failure. values-local.yaml
+  # requires DoNotSchedule, because that cluster can satisfy it and is where it is shown.
+  topologySpreadStrictness: ScheduleAnyway
   # Hosts the gateway is permitted to register as upstreams. The SSRF guard resolves a
   # candidate URL's addresses and rejects loopback, private, link-local and CGNAT space;
   # this allowlist is what re-admits the in-cluster services that are legitimately on

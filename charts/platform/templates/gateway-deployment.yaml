@@ -51,14 +51,46 @@ spec:
     spec:
       {{- include "common.automountServiceAccountToken" $ctx | nindent 6 }}
       {{- include "common.podSecurityContext" $ctx | nindent 6 }}
-      # Spread replicas across nodes where possible. ScheduleAnyway rather than
-      # DoNotSchedule: on a single-node cluster a hard constraint would leave the second
-      # replica Pending forever, and the point is availability, not a rule for its own
-      # sake.
+      # Spread replicas across nodes. The strictness is a VALUE, and 9.3 is why.
+      #
+      # Stage 4 chose ScheduleAnyway on sound reasoning: on a single-node cluster a hard
+      # constraint leaves the second replica Pending forever, and the point is availability
+      # rather than a rule for its own sake. That is still correct for the single-VPS prod
+      # target.
+      #
+      # What 9.3 measured is the consequence on a cluster that CAN satisfy it: with two
+      # schedulable workers available, both gateway pods were observed on urumi-worker2.
+      # ScheduleAnyway is a preference the scheduler weighs against everything else, and it
+      # loses - so the two replicas survived a pod failure and would NOT have survived a node
+      # failure, which is most of the reason for running two.
+      #
+      # So the default stays ScheduleAnyway, safe everywhere, and values-local.yaml requires
+      # DoNotSchedule because that cluster has three nodes and is where the property is shown.
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: {{ .Values.gateway.topologySpreadStrictness }}
+          {{/*
+          matchLabelKeys is what makes DoNotSchedule survive a rolling update, and 9.3 found out
+          the hard way: without it, requiring the spread DEADLOCKED the rollout.
+
+          A spread constraint counts every pod matching its selector - including the OLD
+          ReplicaSet s. With two schedulable nodes, two replicas and maxSurge 1, the rollout tries
+          to create a third pod while one old and one new pod already occupy a node each. Placing
+          it anywhere makes the skew 2, so the scheduler refuses, and the Deployment waits forever:
+            0/3 nodes are available: 1 node(s) had untolerated taint(s),
+            2 node(s) didn t match pod topology spread constraints.
+
+          pod-template-hash differs between ReplicaSets, so including it here scopes the skew
+          calculation to pods of the SAME revision. The new ReplicaSet spreads its own two pods
+          across the two nodes and is not blocked by the outgoing revision.
+
+          This is exactly what the field was added for, and the failure without it is the kind that
+          only appears on the second deploy - the first install has no old ReplicaSet to collide
+          with, so a constraint that looks fine on install hangs the next upgrade.
+          */}}
+          matchLabelKeys:
+            - pod-template-hash
           labelSelector:
             matchLabels:
               {{- include "common.selectorLabels" $ctx | nindent 14 }}
@@ -193,6 +225,29 @@ spec:
             */}}
             - name: CHAT_SELF_MCP_URL
               value: {{ printf "http://127.0.0.1:%v/mcp" (first .Values.gateway.ports).containerPort | quote }}
+          {{/*
+          A preStop delay, so a rolling update costs no requests (9.3).
+
+          MEASURED rather than assumed: a rolling restart under ~6 requests/second dropped 3 of
+          276 - two 502s and one dropped connection. The cause is that Kubernetes sends SIGTERM
+          and removes the pod from the Service endpoints CONCURRENTLY; they are independent
+          asynchronous actions, so there is a window in which the ingress still routes to a pod
+          that has already begun draining. The application shuts down correctly - it is simply
+          told to before the proxy is told to stop sending.
+
+          preStop runs BEFORE SIGTERM, so this sleep is a window in which the pod has been removed
+          from the endpoints and is still serving normally. The cost is dead time on every pod
+          deletion.
+
+          It must stay well under terminationGracePeriodSeconds, because the grace period covers
+          this delay AND the drain that follows - if the sleep consumed the whole period, SIGKILL
+          would arrive mid-drain and cut in-flight calls, turning a fix for dropped requests into
+          a cause of them.
+          */}}
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sleep", "{{ .Values.gateway.preStopDelaySeconds }}"]
           volumeMounts:
             # The root filesystem is read-only, so anything needing a scratch path gets a
             # named volume. Node writes nothing itself; this exists for the OS temp

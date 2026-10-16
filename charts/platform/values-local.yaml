@@ -12,6 +12,11 @@ postgres:
     size: 2Gi
 
 gateway:
+  # Three nodes here, two of them schedulable, so a hard spread constraint is satisfiable -
+  # and requiring it is the only way the "two replicas survive a node failure" claim is
+  # actually true. 9.3 measured BOTH pods on urumi-worker2 under the default soft preference,
+  # which the scheduler is free to ignore and did.
+  topologySpreadStrictness: DoNotSchedule
   # Still 2 locally. The point of the replica count is to prove the /mcp endpoint is
   # genuinely stateless, and proving that on a laptop is the whole reason the kind
   # cluster has two worker nodes.
