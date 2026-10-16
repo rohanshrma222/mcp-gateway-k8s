@@ -192,6 +192,26 @@ const schema = z.object({
    * the truth, and infrequent enough to be invisible.
    */
   CHAT_KEY_SWEEP_INTERVAL_MS: z.coerce.number().int().min(5_000).max(3_600_000).default(60_000),
+
+  /**
+   * Per-key rate limiting (9.2). Enabled by default.
+   *
+   * Default-on rather than default-off, because an unlimited gateway is a gateway where one
+   * misconfigured client can exhaust an upstream - and the upstreams here include a
+   * WooCommerce store whose database is the shop. The limit is generous enough that a human
+   * driving the dashboard or a chat turn making eight tool calls never meets it.
+   */
+  RATE_LIMIT_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+
+  /**
+   * The sustained rate. Burst capacity is one minute's worth, derived rather than exposed:
+   * the two numbers answer different questions and most operators only have an opinion about
+   * the rate.
+   */
+  RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(1).max(100_000).default(120),
 });
 
 export type Config = z.infer<typeof schema>;

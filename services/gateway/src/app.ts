@@ -14,6 +14,7 @@ import cookie from '@fastify/cookie';
 import Fastify, { LogController, type FastifyError } from 'fastify';
 import { ClientPool } from './mcp/pool.js';
 import { makeRequireApiKey } from './auth/bearer.js';
+import { RateLimiter } from './auth/rateLimit.js';
 import { makeRequireAuth, requireRole } from './auth/middleware.js';
 import { authRoutes } from './routes/auth.js';
 import { keyRoutes } from './routes/keys.js';
@@ -182,7 +183,24 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
   // different credential, different lifetime, different revocation story. Sharing one
   // resolver would be one `if` away from letting a session cookie authenticate a tool
   // call, or a long-lived API key drive the dashboard admin routes.
-  const requireApiKey = makeRequireApiKey({ db });
+  /**
+   * The per-key rate limiter (9.2), in Postgres rather than memory.
+   *
+   * An in-process bucket would give each client its full allowance PER POD - two replicas
+   * and a limit of 120/minute is a real limit of 240, changing whenever somebody scales the
+   * Deployment. A limit that silently depends on the replica count is not a limit.
+   */
+  const rateLimiter = config.RATE_LIMIT_ENABLED
+    ? new RateLimiter(db, logger, { requestsPerMinute: config.RATE_LIMIT_PER_MINUTE })
+    : undefined;
+
+  if (rateLimiter === undefined) {
+    logger.warn("RATE_LIMIT_ENABLED is false: /mcp requests are not rate limited");
+  } else {
+    logger.info({ perMinute: config.RATE_LIMIT_PER_MINUTE }, "per-key rate limiting enabled");
+  }
+
+  const requireApiKey = makeRequireApiKey({ db, rateLimiter });
   await app.register(
     mcpRoutes({
       db,

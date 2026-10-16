@@ -14,6 +14,7 @@ import { createMetrics } from './metrics.js';
 import { ClientPool } from './mcp/pool.js';
 import { HealthProber } from './mcp/prober.js';
 import { ChatKeySweeper } from './chat/keySweeper.js';
+import { RateLimiter } from './auth/rateLimit.js';
 import { initDummyHash } from './auth/passwords.js';
 
 // Exits non-zero with the offending field names if anything is missing or malformed.
@@ -68,6 +69,15 @@ const keySweeper = new ChatKeySweeper({
   logger,
   metrics,
   intervalMs: config.CHAT_KEY_SWEEP_INTERVAL_MS,
+  /**
+   * A SECOND RateLimiter instance, which is safe rather than sloppy: the limiter holds no
+   * state of its own - every token lives in the `rate_buckets` table - so this one and the
+   * one inside the app agree by construction. Threading the app instance back out here would
+   * mean changing what createApp returns for the sake of a housekeeping call.
+   */
+  rateLimiter: config.RATE_LIMIT_ENABLED
+    ? new RateLimiter(db, logger, { requestsPerMinute: config.RATE_LIMIT_PER_MINUTE })
+    : undefined,
 });
 
 

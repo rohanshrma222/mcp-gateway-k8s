@@ -117,6 +117,17 @@ spec:
             # alive, not whether it can finish a unit of work. See mcp/prober.ts.
             - name: UPSTREAM_PROBE_TIMEOUT_MS
               value: {{ .Values.gateway.upstreamProbeTimeoutMs | quote }}
+            {{/*
+            Per-key rate limiting (9.2). The bucket lives in Postgres, not in memory, because
+            an in-process bucket gives each client its full allowance PER POD - with
+            gateway.replicas=2 a limit of 120/minute is a real limit of 240, and the number
+            changes whenever somebody scales the Deployment. A limit that silently depends on
+            the replica count is not a limit.
+            */}}
+            - name: RATE_LIMIT_ENABLED
+              value: {{ .Values.gateway.rateLimit.enabled | quote }}
+            - name: RATE_LIMIT_PER_MINUTE
+              value: {{ .Values.gateway.rateLimit.requestsPerMinute | quote }}
             - name: METRICS_ENABLED
               value: {{ .Values.metrics.enabled | quote }}
 

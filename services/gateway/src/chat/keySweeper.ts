@@ -32,6 +32,15 @@ export interface KeySweeperOptions {
   logger: Logger;
   metrics: Metrics | undefined;
   intervalMs: number;
+  /**
+   * Optional: also prune rate-limit buckets belonging to long-revoked keys (9.2).
+   *
+   * Here rather than on its own timer because the two have the SAME CAUSE. Chat mints a key
+   * per message and this project revokes rather than deletes - 4.4 keeps the id resolvable
+   * so audit rows mean something - so every ephemeral key leaves a permanent bucket row
+   * behind. One sweep, one cause, one interval.
+   */
+  rateLimiter?: { pruneRevoked: () => Promise<number> } | undefined;
 }
 
 export class ChatKeySweeper {
@@ -122,6 +131,19 @@ export class ChatKeySweeper {
           { swept: rows.length, keyIds: rows.map((row) => row.key_id) },
           'revoked expired chat keys whose request did not clean up after itself',
         );
+      }
+
+      /**
+       * Bucket pruning runs after the key sweep and its result is logged rather than
+       * returned, because it is housekeeping about rows nobody can use: the keys are already
+       * revoked. An hour of grace before deleting, so a bucket is not removed from under a
+       * request that is mid-flight when its key is revoked.
+       */
+      if (this.options.rateLimiter !== undefined) {
+        const pruned = await this.options.rateLimiter.pruneRevoked();
+        if (pruned > 0) {
+          this.options.logger.debug({ pruned }, "pruned rate-limit buckets for revoked keys");
+        }
       }
 
       return rows.length;
