@@ -174,7 +174,25 @@ export function authRoutes(deps: AuthRouteDeps) {
       { preHandler: deps.requireAuth as never },
       async (request, reply) => {
         const principal = request.principal as Principal;
-        return reply.send({ user: principal });
+        /**
+         * Mapped field by field, not sent as the principal object.
+         *
+         * Returning `principal` directly was shorter and wrong twice over. The internal
+         * shape calls the identifier `userId`, while `POST /api/auth/login` publishes the
+         * same thing as `id` - so the two endpoints described one concept under two
+         * names, and every other entity in this API uses `id`. The dashboard's Members
+         * page reads `session.id` to mark which row is you: it worked after signing in and
+         * silently stopped after a page refresh, because a refresh goes through this
+         * endpoint instead. A bug that appears only on reload is exactly the kind that
+         * survives a demo.
+         *
+         * The second problem is the coupling: spreading an internal object into a response
+         * means any field ever added to the principal is published by accident. Listing
+         * the three fields makes the response a decision rather than a side effect.
+         */
+        return reply.send({
+          user: { id: principal.userId, email: principal.email, role: principal.role },
+        });
       },
     );
 

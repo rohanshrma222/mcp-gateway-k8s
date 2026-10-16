@@ -19,6 +19,8 @@ import { Login } from './routes/Login.js';
 import { Shell } from './routes/Shell.js';
 import { Servers } from './routes/Servers.js';
 import { Audit } from './routes/Audit.js';
+import { Members } from './routes/Members.js';
+import { Keys } from './routes/Keys.js';
 
 export function App() {
   return (
@@ -75,8 +77,8 @@ function Tree() {
         <Route index element={<Navigate to={session.role === 'admin' ? '/servers' : '/tools'} replace />} />
         <Route path="servers" element={<Servers />} />
         <Route path="tools" element={<Pending title="Tools" step="7.2" />} />
-        <Route path="members" element={<Pending title="Members" step="7.3" />} />
-        <Route path="keys" element={<Pending title="API keys" step="7.3" />} />
+        <Route path="members" element={<Members />} />
+        <Route path="keys" element={<Keys />} />
         <Route path="audit" element={<Audit />} />
         <Route path="chat" element={<Pending title="Chat" step="8.3" />} />
         {/* An unknown path inside the app goes home rather than showing a 404. The nav is

@@ -108,12 +108,50 @@ export interface ServerTestResult {
   requestId: string;
 }
 
+/**
+ * A member of the team.
+ *
+ * `disabled` is a boolean rather than the timestamp the column holds - the API converts it,
+ * because the dashboard renders a state and "when exactly was this account disabled" is an
+ * audit-log question rather than a list-row one.
+ */
+export interface Member {
+  id: string;
+  email: string;
+  role: Role;
+  createdAt: string;
+  disabled: boolean;
+}
+
+/**
+ * The invite response. `initialPassword` is the only place it will ever appear.
+ *
+ * Typed as required rather than optional on purpose: if the server ever stopped returning
+ * it, a page that renders "copy this password" would show `undefined` and the admin would
+ * send somebody an account they cannot sign into. A required field means that becomes a
+ * compile error the moment the type is corrected, rather than a confusing support thread.
+ */
+export interface InvitedMember {
+  user: Member;
+  initialPassword: string;
+}
+
 /** An API key. The secret appears exactly once, in the issue response. */
 export interface ApiKey {
   id: string;
   keyId: string;
   name: string;
-  ownerEmail: string;
+  /**
+   * The owner, present only for an admin.
+   *
+   * Optional because the API omits it for a non-admin - correctly, since every key in a
+   * member's list is theirs and the field would be noise. Declaring it required was a type
+   * claiming a field the response does not always carry, which is the same class of mistake
+   * as 7.2's three shape bugs. Caught by a test asserting on it and getting undefined.
+   */
+  ownerEmail?: string;
+  /** Mirrors `revokedAt !== null`; the API sends both. */
+  revoked: boolean;
   createdAt: string;
   lastUsedAt: string | null;
   revokedAt: string | null;

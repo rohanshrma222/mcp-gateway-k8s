@@ -30,7 +30,17 @@ export function Dialog({
   open: boolean;
   onClose: () => void;
   title: string;
-  description?: string;
+  /**
+   * Optional, and typed as `string | undefined` rather than just optional.
+   *
+   * Under `exactOptionalPropertyTypes` those are different: a plain `description?: string`
+   * rejects an explicitly-passed undefined, which is exactly what a caller writing
+   * `description={done ? undefined : "..."}` produces. Two call sites do that, and the
+   * alternative is a conditional spread at each one - noise to satisfy a distinction that
+   * does not matter here, because an absent description and an undefined one render the
+   * same.
+   */
+  description?: string | undefined;
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDialogElement>(null);

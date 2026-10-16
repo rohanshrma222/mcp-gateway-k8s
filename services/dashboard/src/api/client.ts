@@ -18,7 +18,10 @@ import type {
   AggregatedTool,
   AuditPage,
   AuditSummaryBucket,
+  InvitedMember,
   IssuedApiKey,
+  Member,
+  Role,
   ServerTestResult,
   Session,
   UpstreamServer,
@@ -166,6 +169,42 @@ export const api = {
 
     async logout(): Promise<void> {
       await request<void>('/api/auth/logout', { method: 'POST' });
+    },
+  },
+
+  users: {
+    async list(): Promise<Member[]> {
+      const result = await request<{ users: Member[] }>('/api/users');
+      return result.users;
+    },
+
+    /**
+     * Invite a member.
+     *
+     * The password comes back in this response and nowhere else, ever - there is no
+     * endpoint that could return it again, which is what makes "shown once" a property
+     * rather than an intention. The caller is responsible for showing it to the admin
+     * before the state holding it is discarded; see `SecretOnce`.
+     */
+    async invite(email: string, role: Role): Promise<InvitedMember> {
+      return request('/api/users', { method: 'POST', body: { email, role } });
+    },
+
+    /**
+     * Change a role, or disable an account.
+     *
+     * Partial, and the gateway refuses two things with a 409 rather than a 403: an admin
+     * removing their own admin access, and demoting or disabling the last enabled admin.
+     * Both are authorised requests that conflict with the state of the system, which is
+     * what 409 means - so the UI surfaces the message rather than treating it as a
+     * permission problem.
+     */
+    async update(id: string, patch: { role?: Role; disabled?: boolean }): Promise<Member> {
+      const result = await request<{ user: Member }>(`/api/users/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: patch,
+      });
+      return result.user;
     },
   },
 
