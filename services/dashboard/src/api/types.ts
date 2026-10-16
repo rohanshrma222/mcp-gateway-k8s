@@ -195,3 +195,27 @@ export interface AuditSummaryBucket {
   count: number;
   p95Ms: number | null;
 }
+
+/**
+ * One event from the chat stream.
+ *
+ * Mirrors `AgentEvent` in the gateway, plus the `error` type the route adds when something
+ * fails after the response headers have already gone out. Declared here rather than shared
+ * from the gateway package because the dashboard is a separate build with no import path
+ * into the server - and because this is the wire contract, which is worth writing down on
+ * its own terms. 7.2's three shape bugs all came from assuming a shape instead of stating
+ * it.
+ */
+export type ChatEvent =
+  | { type: 'text'; text: string }
+  | { type: 'tool_call'; tool: string; args?: unknown }
+  | {
+      type: 'tool_result';
+      tool: string;
+      outcome: 'ok' | 'error';
+      durationMs: number;
+      summary?: string;
+    }
+  | { type: 'notice'; text: string }
+  | { type: 'error'; text: string }
+  | { type: 'done' };

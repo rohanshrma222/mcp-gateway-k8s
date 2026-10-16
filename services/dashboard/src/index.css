@@ -239,3 +239,34 @@
     transform: translateY(0) scale(1);
   }
 }
+
+/**
+ * The streaming caret.
+ *
+ * `steps(2, start)` rather than a fade, because a text cursor blinks - it is on or off, and
+ * a smooth opacity ramp reads as a glow rather than a cursor. 1s is the rate a terminal
+ * caret uses and the one every reader already recognises.
+ *
+ * It is the only animation on the Chat page. Streaming text is itself the fastest-changing
+ * thing in this app, and animating the tokens would blur text somebody is actively reading;
+ * the caret earns its place because it carries the one piece of state the text cannot - the
+ * difference between a reply that has paused and a reply that has finished.
+ */
+@keyframes caret {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/**
+ * Respect a reduced-motion preference by simply leaving the caret visible. It still marks
+ * the live position; it just does not blink.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .animate-\[caret_1s_steps\(2\2c start\)_infinite\] {
+    animation: none;
+  }
+}

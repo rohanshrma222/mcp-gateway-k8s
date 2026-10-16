@@ -15,6 +15,7 @@
  */
 import type {
   ApiKey,
+  ChatEvent,
   AggregatedTool,
   AuditPage,
   AuditSummaryBucket,
@@ -289,6 +290,115 @@ export const api = {
     async list(): Promise<AggregatedTool[]> {
       const result = await request<{ tools: AggregatedTool[] }>('/api/tools');
       return result.tools;
+    },
+  },
+
+  chat: {
+    /**
+     * Send a message and consume the streamed reply.
+     *
+     * **Not `EventSource`, and that is forced rather than chosen.** `EventSource` is the
+     * browser's built-in SSE client and it would handle the framing and reconnection for
+     * free - but it can only issue a GET, cannot send a request body, and cannot set
+     * headers. The message and the conversation history have to go up in a body, so the
+     * whole built-in path is unavailable and the framing has to be parsed by hand.
+     *
+     * The consolation is that `EventSource`'s automatic reconnection would be actively
+     * wrong here. It retries by re-issuing the request, which for a chat turn means sending
+     * the message again - a second model call, a second set of tool calls, a second set of
+     * audit rows and, for anything that writes, a duplicated side effect. A chat turn is not
+     * idempotent, so silent retry is the last thing it should do.
+     *
+     * Returns an `AbortController` so the caller can stop the turn. That matters more than
+     * usual: `routes/chat.ts` listens for the client disconnecting and aborts the model
+     * request, so abandoning a reply actually stops the work and the billing rather than
+     * just hiding it.
+     */
+    send(
+      message: string,
+      history: { role: 'user' | 'assistant'; content: string }[],
+      onEvent: (event: ChatEvent) => void,
+    ): { done: Promise<void>; abort: () => void } {
+      const controller = new AbortController();
+
+      const done = (async (): Promise<void> => {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', accept: 'text/event-stream' },
+          body: JSON.stringify({ message, history }),
+          signal: controller.signal,
+        });
+
+        /**
+         * A non-2xx here is a real HTTP error, and the route is careful to resolve every
+         * failure it CAN report that way - a bad body, or no model key configured - before
+         * it writes the SSE headers. After those headers the status is pinned at 200 and
+         * failures arrive as `error` events instead, which is why both paths exist.
+         */
+        if (!response.ok) {
+          let message = `the chat request failed with HTTP ${response.status}`;
+          try {
+            const body = (await response.json()) as { error?: string };
+            if (typeof body.error === 'string' && body.error !== '') message = body.error;
+          } catch {
+            // Not JSON; the generic sentence stands.
+          }
+          if (response.status === 401) onUnauthorized?.();
+          throw new ApiError(response.status, message);
+        }
+
+        if (response.body === null) {
+          throw new ApiError(response.status, 'the chat stream was empty');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        try {
+          while (true) {
+            const { done: finished, value } = await reader.read();
+            if (finished) break;
+
+            // `stream: true` so a multi-byte character split across two network chunks is
+            // held until complete rather than emitted as a replacement character. Tool
+            // output in this system is arbitrary user text and does contain non-ASCII.
+            buffer += decoder.decode(value, { stream: true });
+
+            // Events are separated by a blank line. A chunk boundary can fall anywhere,
+            // including mid-field, so whatever has not yet been terminated stays in the
+            // buffer - parsing each chunk independently would silently drop it.
+            let split = buffer.indexOf('\n\n');
+            while (split !== -1) {
+              const frame = buffer.slice(0, split);
+              buffer = buffer.slice(split + 2);
+
+              for (const line of frame.split('\n')) {
+                if (!line.startsWith('data:')) continue;
+                const payload = line.slice('data:'.length).trim();
+                if (payload === '') continue;
+                try {
+                  onEvent(JSON.parse(payload) as ChatEvent);
+                } catch {
+                  // One unparseable frame is skipped rather than failing the turn. The
+                  // stream is a sequence of independent events, so the cost is one event;
+                  // aborting would cost the whole answer.
+                }
+              }
+
+              split = buffer.indexOf('\n\n');
+            }
+          }
+        } finally {
+          /**
+           * Releasing the lock matters on an abort: without it the response body stays
+           * locked and the underlying connection is held until the browser gives up.
+           */
+          reader.releaseLock();
+        }
+      })();
+
+      return { done, abort: () => controller.abort() };
     },
   },
 

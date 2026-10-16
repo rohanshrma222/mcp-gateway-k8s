@@ -21,6 +21,7 @@ import { Shell } from './routes/Shell.js';
 import { Servers } from './routes/Servers.js';
 import { Audit } from './routes/Audit.js';
 import { Tools } from './routes/Tools.js';
+import { Chat } from './routes/Chat.js';
 import { Members } from './routes/Members.js';
 import { Keys } from './routes/Keys.js';
 
@@ -82,7 +83,7 @@ function Tree() {
         <Route path="members" element={<Members />} />
         <Route path="keys" element={<Keys />} />
         <Route path="audit" element={<Audit />} />
-        <Route path="chat" element={<Pending title="Chat" step="8.3" />} />
+        <Route path="chat" element={<Chat />} />
         {/* An unknown path inside the app goes home rather than showing a 404. The nav is
             the only way to reach these routes, so a bad path here is a stale bookmark. */}
         <Route path="*" element={<Navigate to="/" replace />} />
@@ -135,17 +136,5 @@ function StartupHold() {
         </p>
       </div>
     </main>
-  );
-}
-
-function Pending({ title, step }: { title: string; step: string }) {
-  return (
-    <section>
-      <h1 className="text-lg font-semibold tracking-tight text-ink-50">{title}</h1>
-      <p className="mt-2 max-w-prose text-sm text-ink-400">
-        This page is delivered by step {step}. The shell, session handling, role-aware
-        navigation and the typed API client it will use are in place.
-      </p>
-    </section>
   );
 }
