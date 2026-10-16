@@ -39,7 +39,20 @@ export interface ChatRouteDeps {
    * that, which is more useful than a missing endpoint.
    */
   provider: LlmProvider | undefined;
-  systemPrompt: string;
+  /**
+   * Builds the system prompt for a given user.
+   *
+   * A builder rather than a fixed string, which is a correction to how 8.1 wired this: the
+   * prompt there was built once at registration with the literal placeholders "the
+   * signed-in user" and "as recorded", so the agent was told nothing about who it was
+   * acting as. The prompt now names the real account.
+   *
+   * The values come from `request.principal`, which the session middleware derived from a
+   * verified cookie against the live database row - NOT from the request body. So the
+   * original concern behind passing a plain string (that a request must not be able to
+   * influence what the agent is told it is) still holds: the body cannot reach this.
+   */
+  buildSystemPrompt: (options: { userEmail: string; role: string }) => string;
 }
 
 const historyMessage = z.object({
@@ -145,7 +158,10 @@ export function chatRoutes(deps: ChatRouteDeps): FastifyPluginAsync {
           mcpUrl: deps.config.CHAT_SELF_MCP_URL,
           apiKey: key.presented,
           provider: deps.provider,
-          systemPrompt: deps.systemPrompt,
+          systemPrompt: deps.buildSystemPrompt({
+            userEmail: principal.email,
+            role: principal.role,
+          }),
           maxIterations: deps.config.CHAT_MAX_ITERATIONS,
           logger: deps.logger.child({ requestId: request.id, userId: principal.userId }),
           signal: controller.signal,

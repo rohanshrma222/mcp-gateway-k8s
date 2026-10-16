@@ -175,7 +175,66 @@ export function normaliseToolSchema(input: unknown): NormalisedSchema | Rejected
     schema.properties = {};
   }
 
+  allowNullOnOptionalProperties(schema);
+
   return { ok: true, schema };
+}
+
+/**
+ * Let every optional property also accept `null`.
+ *
+ * **Found by running the agent, and it blocks almost every tool.** The model called
+ * `notes__list_notes` with `{"author": null, "product": null}` - both optional filters it
+ * had no value for - and the turn died with the provider's own message:
+ *
+ *     Tool call validation failed: parameters for tool notes__list_notes did not match
+ *     schema: errors: [`/author`: expected string, but got null,
+ *                      `/product`: expected string, but got null]
+ *
+ * Groq validates arguments against the schema we sent, server-side, before the call ever
+ * reaches us. And sending `null` for "I have no value for this" is extremely common model
+ * behaviour - arguably more natural than omitting the key. Since most tools in this system
+ * have optional parameters, the agent was broken for most of its tool set, and the result
+ * was not a wrong answer but a dead turn with a provider error.
+ *
+ * The schemas come from the MCP SDK's zod conversion, where `.optional()` becomes "absent
+ * from `required`" and never "nullable". So the schema is correct about the upstream and
+ * wrong about how a model talks.
+ *
+ * **The important subtlety:** widening the schema alone would break the call one step
+ * later. The upstream's own zod still rejects `null` for an `.optional()` field, so the
+ * provider would accept the call and notes-mcp would refuse it. The two halves go together -
+ * this function widens what the MODEL may send, and `agent.ts` strips null-valued keys
+ * before dispatching, so the upstream receives the omission the model meant.
+ */
+function allowNullOnOptionalProperties(schema: Record<string, unknown>): void {
+  const properties = schema.properties as Record<string, unknown>;
+  const required = Array.isArray(schema.required) ? schema.required : [];
+
+  for (const [name, raw] of Object.entries(properties)) {
+    // A required property that is null is a genuine error and should still be rejected -
+    // the model has failed to supply something the tool needs, and letting it through would
+    // turn a clear provider error into a confusing upstream one.
+    if (required.includes(name)) continue;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+
+    const property = raw as Record<string, unknown>;
+
+    if (typeof property.type === 'string' && property.type !== 'null') {
+      property.type = [property.type, 'null'];
+    } else if (Array.isArray(property.type) && !property.type.includes('null')) {
+      property.type = [...property.type, 'null'];
+    }
+
+    /**
+     * An enum has to list null too, or the validator rejects it for not being a member
+     * even once the type permits it. Appended rather than replacing the list, so the real
+     * options are untouched.
+     */
+    if (Array.isArray(property.enum) && !property.enum.includes(null)) {
+      property.enum = [...property.enum, null];
+    }
+  }
 }
 
 export interface ToolForModel {

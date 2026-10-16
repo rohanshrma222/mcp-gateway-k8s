@@ -129,6 +129,40 @@ foreach ($r in $releases) {
         '--wait', '--timeout', '10m'
     )
     Write-Ok "$($r.Release) deployed"
+
+    # ---------------------------------------------------------------------------------
+    # Force the new images to actually run.
+    #
+    # This script built and loaded images a few steps above, all tagged `:dev`. A mutable
+    # tag means a code-only change produces an IDENTICAL pod spec, so `helm upgrade`
+    # reports "Upgrade complete", changes nothing, and the old pods keep serving the old
+    # code. Only a values or template change happens to trigger a rollout, which is why
+    # this went unnoticed for several steps - most deploys here changed something in the
+    # chart as well.
+    #
+    # It cost two false test results in step 8.2: a prompt-injection defence was tested
+    # twice against a gateway that was not running it, and the passes were credited to code
+    # that was not deployed. The failure mode is the dangerous kind, because the deploy
+    # reports success and the only symptom is behaviour that does not match the source.
+    #
+    # `rollout restart` sets a template annotation, which changes the pod spec, which is
+    # what makes the rollout happen. The real fix is content-addressed tags - building
+    # `urumi/gateway:<git-sha>` so the spec changes whenever the code does - and that is
+    # what values-prod.yaml already points at for GHCR. For a local loop against a mutable
+    # tag this is the honest workaround, and doing it unconditionally is right: a restart
+    # with no new image costs a few seconds, while skipping one costs a wrong conclusion.
+    #
+    # StatefulSets are included; databases roll one pod at a time and keep their PVCs.
+    $workloads = & $kubectl get deployment,statefulset -n $r.Namespace -o name 2>$null
+    foreach ($w in $workloads) {
+        if ([string]::IsNullOrWhiteSpace($w)) { continue }
+        Invoke-Native -Exe $kubectl -Arguments @('rollout', 'restart', $w, '-n', $r.Namespace) -Quiet
+    }
+    foreach ($w in $workloads) {
+        if ([string]::IsNullOrWhiteSpace($w)) { continue }
+        Invoke-Native -Exe $kubectl -Arguments @('rollout', 'status', $w, '-n', $r.Namespace, '--timeout', '10m') -Quiet
+    }
+    Write-Ok "$($r.Release) workloads restarted onto the newly loaded images"
 }
 
 # ------------------------------------------------------------------------------ summary

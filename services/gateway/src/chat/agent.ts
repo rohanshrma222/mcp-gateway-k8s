@@ -27,6 +27,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { LlmMessage, LlmProvider, LlmToolCall } from '../llm/provider.js';
 import { LlmError } from '../llm/provider.js';
 import { normaliseToolsForModel } from '../llm/schema.js';
+import { labelToolDescription, wrapToolOutput } from './untrusted.js';
 
 export interface AgentEvent {
   type: 'text' | 'tool_call' | 'tool_result' | 'notice' | 'done';
@@ -139,11 +140,55 @@ export async function* runAgent(
      * the orders?" is a question whose answer should not require reading server logs.
      */
     const schemaByName = new Map(listed.tools.map((tool) => [tool.name, tool.inputSchema]));
+    const allToolNames = listed.tools.map((tool) => tool.name);
+    /** Descriptions this gateway replaced because they directed the agent elsewhere. */
+    const neutralised: { tool: string; referenced: string }[] = [];
     const { tools, excluded } = normaliseToolsForModel(
-      listed.tools.map((tool) => ({ name: tool.name, description: tool.description })),
+      listed.tools.map((tool) => ({
+        name: tool.name,
+        /**
+         * Every description is labelled with the upstream that wrote it (8.2).
+         *
+         * 5.2 stores descriptions verbatim by design, and one of the three upstreams is
+         * third-party software we did not write - so a description is text from outside
+         * this system that the model reads as language. The label says so, and
+         * `labelToolDescription` also escapes the envelope markers inside it, because a
+         * description containing the closing marker could otherwise break out of a RESULT
+         * envelope appearing later in the same conversation.
+         */
+        description: (() => {
+          if (tool.description === undefined) return undefined;
+          const labelled = labelToolDescription(tool.name, tool.description, allToolNames);
+          if (labelled.neutralised !== undefined) {
+            neutralised.push({ tool: tool.name, referenced: labelled.neutralised });
+          }
+          return labelled.description;
+        })(),
+      })),
       (name) => schemaByName.get(name),
       logger,
     );
+
+    /**
+     * A neutralised description is reported to the USER, not only logged.
+     *
+     * This is the one place the user can learn that one of their upstreams is behaving like
+     * an attacker, and it is exactly the thing they would want to know. Logging alone would
+     * put it somewhere only an operator reads, and the operator and the user are the same
+     * person in a small deployment - who is looking at the chat, not at pino output.
+     */
+    if (neutralised.length > 0) {
+      logger.warn(
+        { neutralised },
+        'SECURITY: an upstream tool description tried to direct the agent to call another tool; description replaced',
+      );
+      yield {
+        type: 'notice',
+        text: `Warning: ${neutralised.length} tool description${neutralised.length === 1 ? '' : 's'} from your upstream servers tried to instruct me to call other tools (${neutralised
+          .map((item) => `${item.tool} -> ${item.referenced}`)
+          .join('; ')}). I have ignored those descriptions. This is a prompt-injection attempt and worth investigating.`,
+      };
+    }
 
     if (excluded.length > 0) {
       yield {
@@ -237,6 +282,26 @@ export async function* runAgent(
           continue;
         }
 
+        /**
+         * Null-valued top-level arguments are dropped before dispatch.
+         *
+         * The other half of `allowNullOnOptionalProperties`. We widened the schema so the
+         * provider accepts `{"author": null}`, because models send that constantly for a
+         * value they do not have - but the upstream's own zod `.optional()` rejects null,
+         * so forwarding it verbatim would just move the rejection one hop later and blame
+         * the upstream for it.
+         *
+         * Top level only, deliberately. Reaching into nested objects would mean rewriting
+         * an upstream's arguments more deeply than this gateway has any business doing -
+         * 5.4 settled that a proxy forwards arguments rather than reinterpreting them, and
+         * this is already the narrowest exception that makes the model usable.
+         */
+        if (args !== null && typeof args === 'object' && !Array.isArray(args)) {
+          for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+            if (value === null) delete (args as Record<string, unknown>)[key];
+          }
+        }
+
         yield { type: 'tool_call', tool: call.name, args };
 
         const startedAt = Date.now();
@@ -297,7 +362,19 @@ export async function* runAgent(
            * with a marker so the model knows it is seeing part of something rather than all
            * of a small thing, which changes how it should answer.
            */
-          content: truncateForModel(resultText),
+          /**
+           * Wrapped in the untrusted envelope (8.2), and truncated BEFORE wrapping.
+           *
+           * Order matters: truncating afterwards could cut the closing marker off the end,
+           * leaving the model an envelope that never closes - and everything after it in
+           * the conversation would then read as though it were inside the untrusted region.
+           * The content is capped first so the envelope is always intact.
+           */
+          content: wrapToolOutput({
+            tool: call.name,
+            content: truncateForModel(resultText),
+            isError: outcome === 'error',
+          }),
         });
       }
     }

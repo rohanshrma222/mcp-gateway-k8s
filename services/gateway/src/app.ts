@@ -164,7 +164,7 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
       logger,
       requireAuth: requireAuth as never,
       provider: chatProvider,
-      systemPrompt: buildSystemPrompt({ userEmail: "the signed-in user", role: "as recorded" }),
+      buildSystemPrompt,
     }),
   );
 
