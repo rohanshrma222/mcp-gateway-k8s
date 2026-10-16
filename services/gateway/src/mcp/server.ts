@@ -31,6 +31,7 @@ import type { Db } from '../db.js';
 import type { Logger } from '../logger.js';
 import type { Metrics } from '../metrics.js';
 import { listAggregatedTools, resolveTool } from './aggregator.js';
+import { decide, decideOne, cacheKey } from '../auth/permissions.js';
 import { splitToolName } from './naming.js';
 import { UpstreamUnavailableError, type ClientPool, type UpstreamFailureKind } from './pool.js';
 import { CredentialError, loadUpstream } from './upstreams.js';
@@ -126,10 +127,41 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
    * and annotations are passed through exactly as the upstream published them.
    */
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools = await listAggregatedTools(deps.db);
+    const all = await listAggregatedTools(deps.db);
+
+    /**
+     * Permission filtering (9.1), using the SAME decision function the call path uses.
+     *
+     * Not merely convenient: if the two paths evaluated permissions separately they
+     * could disagree, and both directions are bad. Visible-but-uncallable looks like a
+     * broken gateway; hidden-but-callable is a hole that testing through the UI can
+     * never find, because the UI never asks for the tool it was not shown.
+     *
+     * One batch query for the whole list rather than one per tool, so this stays a fixed
+     * cost on what is the hot path of every MCP client connection.
+     */
+    const decisions = await decide(
+      deps.db,
+      { userId: deps.principal.userId, role: deps.principal.role },
+      all.map((tool) => ({ serverId: tool.serverId, toolName: tool.upstreamToolName })),
+    );
+
+    const tools = all.filter(
+      (tool) => decisions.get(cacheKey(tool.serverId, tool.upstreamToolName))?.allowed === true,
+    );
 
     deps.logger.debug(
-      { requestId: deps.requestId, userId: deps.principal.userId, toolCount: tools.length },
+      {
+        requestId: deps.requestId,
+        userId: deps.principal.userId,
+        role: deps.principal.role,
+        toolCount: tools.length,
+        // Counts rather than names. A member seeing a filtered list is the system
+        // working, so this is not a warning - but "why can the agent not see
+        // woo__create_product" is a real question, and the counts say immediately
+        // whether filtering happened at all before anyone starts reading rules.
+        hiddenByPermissions: all.length - tools.length,
+      },
       'served tools/list from cache',
     );
 
@@ -313,19 +345,56 @@ export function buildGatewayServer(deps: GatewayServerDeps): {
     const tool = resolved.tool;
 
     /**
-     * The permission check goes HERE, and today it is a deliberate no-op.
+     * The permission check (9.1), at the point stage 5 reserved for it: after the tool
+     * name has resolved, before any upstream is contacted.
      *
-     * Stage 9 adds per-user and per-role tool permissions, resolved against the
-     * `tool_permissions` table built in migration 004. The hook is in place at the correct
-     * point - after resolution, before any upstream is contacted - so that step wires in
-     * a decision rather than restructuring this handler.
+     * **Both paths, deliberately.** `tools/list` hides what this user may not call, and
+     * this refuses it anyway. Hiding alone is a UI convenience an attacker skips by
+     * guessing a name - and names here are guessable by construction, being
+     * `<server>__<tool>` with the slugs visible on the dashboard. A client that never
+     * calls `tools/list` is entirely normal.
      *
-     * The requirement it must satisfy is already decided: a tool a user may not call is
-     * BOTH hidden from `tools/list` and refused here. Hiding alone is a UI convenience an
-     * attacker skips by guessing the name, which is why this check is on the call path and
-     * not only on the list path. The outcome vocabulary already includes `denied` for
-     * exactly this.
+     * Refused BEFORE `loadUpstream`, so a denied call never decrypts a credential and
+     * never opens a connection. That ordering is the difference between a permission
+     * check and one that still reveals whether an upstream is reachable.
      */
+    const decision = await decideOne(
+      deps.db,
+      { userId: deps.principal.userId, role: deps.principal.role },
+      { serverId: tool.serverId, toolName: tool.upstreamToolName },
+    );
+
+    if (!decision.allowed) {
+      /**
+       * `denied`, not `error` - which is why 6.1 put that value in the outcome
+       * vocabulary. It separates "you may not" from "it broke" in the audit log, so a
+       * refused call does not read as an outage when somebody reviews the dashboard.
+       *
+       * The message names the tool and the reason. A deliberately vague refusal was
+       * considered and rejected: the caller already knows the tool exists - they named
+       * it - so withholding why tells them nothing they could not infer, while making a
+       * legitimate permission problem unexplainable. The opposite judgement to login's
+       * deliberate ambiguity, for the opposite reason: there the caller is anonymous and
+       * any detail helps enumeration.
+       */
+      deps.logger.info(
+        {
+          requestId: deps.requestId,
+          userId: deps.principal.userId,
+          role: deps.principal.role,
+          tool: exposedName,
+          ruleId: decision.ruleId,
+        },
+        'tool call denied by permissions',
+      );
+
+      return fail(
+        `you are not permitted to call "${exposedName}": ${decision.reason}. Ask an admin to grant access, or call tools/list to see what you may use.`,
+        'denied',
+        'permission_denied',
+        { slug: tool.serverSlug, id: tool.serverId },
+      );
+    }
 
     let loaded;
     try {

@@ -16,6 +16,8 @@
 import type {
   ApiKey,
   ChatEvent,
+  EffectivePermissions,
+  PermissionRule,
   AggregatedTool,
   AuditPage,
   AuditSummaryBucket,
@@ -399,6 +401,34 @@ export const api = {
       })();
 
       return { done, abort: () => controller.abort() };
+    },
+  },
+
+  permissions: {
+    async list(): Promise<PermissionRule[]> {
+      const body = await request<{ rules: PermissionRule[] }>("/api/permissions");
+      return body.rules;
+    },
+
+    async create(rule: {
+      role?: "admin" | "member";
+      userId?: string;
+      serverId?: string;
+      toolName?: string;
+      effect: "allow" | "deny";
+    }): Promise<{ id: string }> {
+      return request<{ id: string }>("/api/permissions", { method: "POST", body: rule });
+    },
+
+    async remove(id: string): Promise<void> {
+      await request<void>(`/api/permissions/${encodeURIComponent(id)}`, { method: "DELETE" });
+    },
+
+    /** Asks the gateway what a user may call, rather than computing it in the browser. */
+    async effective(userId: string): Promise<EffectivePermissions> {
+      return request<EffectivePermissions>(
+        `/api/permissions/effective?userId=${encodeURIComponent(userId)}`,
+      );
     },
   },
 

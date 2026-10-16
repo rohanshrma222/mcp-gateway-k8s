@@ -150,6 +150,172 @@ function safeHost(url: string): string | undefined {
   }
 }
 
+/**
+ * The starting permission policy (9.1).
+ *
+ * The gateway defaults to DENY when no rule matches, so without this nothing is callable
+ * by anyone - including an admin. That makes this function load-bearing in a way
+ * `seedUpstreams` is not, and it is the direct cost of default-deny, stated rather than
+ * hidden: the policy has to exist before the system is usable.
+ *
+ * Driven by SEED_PERMISSIONS from the values file for the same reason as the upstreams:
+ * a reviewer can read the starting policy without reading TypeScript, and changing it is a
+ * values change rather than a rebuild.
+ *
+ * ON CONFLICT DO NOTHING against the unique scope indexes, so this is a STARTING POINT and
+ * not an authority. An admin who deletes the "members may read the store" rule gets to
+ * keep that decision through the next `helm upgrade`, exactly as a renamed or disabled
+ * upstream survives 5.5. The alternative - reasserting the file on every deploy - would
+ * silently undo deliberate administrative changes, which is worse than drift.
+ */
+async function seedPermissions(db: ReturnType<typeof createPool>, logger: Logger): Promise<void> {
+  const raw = process.env['SEED_PERMISSIONS'];
+  if (raw === undefined || raw.trim() === '') {
+    /**
+     * A warning, not a silent skip, and deliberately loud about the consequence.
+     *
+     * An empty policy under default-deny is a gateway where every tool call is refused,
+     * which presents as "the agent says it has no tools" - a symptom nobody connects to a
+     * missing seed. Saying so here is the difference between a two-minute diagnosis and an
+     * afternoon.
+     */
+    logger.warn(
+      'SEED_PERMISSIONS is empty: no permission rules will be created, and the gateway denies by default, so every tool call will be refused until rules are added',
+    );
+    return;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    process.stderr.write('seed: SEED_PERMISSIONS is not valid JSON\n');
+    process.exit(1);
+  }
+
+  const schema = z.array(
+    z
+      .object({
+        /** `role:admin`, `role:member`, or `user:someone@example.com`. */
+        subject: z.string().min(1).max(330),
+        /** An upstream slug. Omitted means every server. */
+        server: z.string().min(1).max(60).optional(),
+        /** The upstream's own tool name, unprefixed. Requires `server`. */
+        tool: z.string().min(1).max(200).optional(),
+        effect: z.enum(['allow', 'deny']),
+      })
+      /**
+       * Mirrors the CHECK constraint in migration 004 rather than trusting it to catch
+       * this. The database would reject it anyway, but as a constraint violation naming a
+       * constraint - whereas here it can say which entry and why, before anything is
+       * written. A bare tool name is genuinely ambiguous in this system: there are two
+       * tools called `list_products`.
+       */
+      .refine((rule) => rule.tool === undefined || rule.server !== undefined, {
+        message: 'a rule naming a tool must also name its server',
+      }),
+  );
+
+  const rules = schema.safeParse(parsed);
+  if (!rules.success) {
+    const issues = rules.error.issues
+      .map((issue) => `  - ${issue.path.join('.')}: ${issue.message}`)
+      .join('\n');
+    process.stderr.write(`seed: SEED_PERMISSIONS is invalid.\n${issues}\n`);
+    process.exit(1);
+  }
+
+  let created = 0;
+  let skipped = 0;
+
+  for (const rule of rules.data) {
+    /**
+     * The subject is resolved here rather than in SQL, so a typo is a clear error instead
+     * of a rule that silently matches nobody - which is the worst outcome for a permission
+     * seed, because the system looks configured and is not.
+     */
+    let role: string | null = null;
+    let userId: string | null = null;
+
+    if (rule.subject.startsWith('role:')) {
+      const name = rule.subject.slice('role:'.length);
+      if (name !== 'admin' && name !== 'member') {
+        process.stderr.write(`seed: SEED_PERMISSIONS has an unknown role "${name}"\n`);
+        process.exit(1);
+      }
+      role = name;
+    } else if (rule.subject.startsWith('user:')) {
+      const email = rule.subject.slice('user:'.length).trim().toLowerCase();
+      const found = await db.query<{ id: string }>(
+        'SELECT id FROM users WHERE email = $1',
+        [email],
+      );
+      const row = found.rows[0];
+      if (row === undefined) {
+        /**
+         * A missing user is skipped with a warning rather than fatal. The seed runs on
+         * every upgrade, and a policy file may reasonably name somebody who has not been
+         * invited yet - failing the whole Job over that would block a deploy for a rule
+         * that is merely premature.
+         */
+        logger.warn(
+          { email },
+          'SEED_PERMISSIONS names a user who does not exist; skipping that rule',
+        );
+        skipped += 1;
+        continue;
+      }
+      userId = row.id;
+    } else {
+      process.stderr.write(
+        `seed: SEED_PERMISSIONS subject "${rule.subject}" must start with "role:" or "user:"\n`,
+      );
+      process.exit(1);
+    }
+
+    /**
+     * The server slug is resolved to an id in SQL, and a rule naming an unknown slug is
+     * skipped rather than failing.
+     *
+     * `seedUpstreams` runs before this and uses ON CONFLICT DO NOTHING, so a slug an admin
+     * deliberately removed stays removed - and a permission rule still mentioning it is a
+     * leftover, not an error worth blocking a deploy for.
+     */
+    let serverId: string | null = null;
+    if (rule.server !== undefined) {
+      const found = await db.query<{ id: string }>(
+        'SELECT id FROM mcp_servers WHERE slug = $1',
+        [rule.server],
+      );
+      const row = found.rows[0];
+      if (row === undefined) {
+        logger.warn(
+          { slug: rule.server },
+          'SEED_PERMISSIONS names an upstream that is not registered; skipping that rule',
+        );
+        skipped += 1;
+        continue;
+      }
+      serverId = row.id;
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO tool_permissions (role, user_id, server_id, tool_name, effect)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT DO NOTHING`,
+      [role, userId, serverId, rule.tool ?? null, rule.effect],
+    );
+
+    if ((inserted.rowCount ?? 0) > 0) created += 1;
+    else skipped += 1;
+  }
+
+  logger.info(
+    { created, skipped, total: rules.data.length },
+    'seeded tool permissions',
+  );
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const logger = createLogger(config.LOG_LEVEL).child({ component: 'seed' });
@@ -209,6 +375,13 @@ async function main(): Promise<void> {
     }
 
     await seedUpstreams(db, logger, config.UPSTREAM_ALLOWLIST);
+
+
+    // After the upstreams, because a rule naming a server has to resolve its slug to an
+
+    // id - and after the users, because a `user:` rule has to resolve an email.
+
+    await seedPermissions(db, logger);
 
     const counts = await db.query<{ role: string; n: string }>(
       'SELECT role, count(*)::text AS n FROM users GROUP BY role ORDER BY role',

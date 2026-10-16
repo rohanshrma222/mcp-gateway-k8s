@@ -21,6 +21,7 @@ import { mcpRoutes } from './routes/mcp.js';
 import { serverRoutes } from './routes/servers.js';
 import { toolRoutes } from './routes/tools.js';
 import { auditRoutes } from './routes/audit.js';
+import { permissionRoutes } from './routes/permissions.js';
 import { chatRoutes } from './routes/chat.js';
 import { GroqProvider } from './llm/groq.js';
 import { buildSystemPrompt } from './chat/prompt.js';
@@ -129,6 +130,15 @@ export async function buildApp({ config, logger, db, metrics, pool }: AppDeps) {
 
   await app.register(toolRoutes({ db, requireAuth: requireAuth as never }));
   await app.register(auditRoutes({ db, requireAuth: requireAuth as never }));
+
+  await app.register(
+    permissionRoutes({
+      db,
+      logger,
+      requireAuth: requireAuth as never,
+      requireAdmin: requireRole("admin") as never,
+    }),
+  );
 
   /**
    * The chat agent.

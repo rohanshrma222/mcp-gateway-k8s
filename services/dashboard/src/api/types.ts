@@ -219,3 +219,31 @@ export type ChatEvent =
   | { type: 'notice'; text: string }
   | { type: 'error'; text: string }
   | { type: 'done' };
+
+/** One rule in the tool permission policy (9.1). */
+export interface PermissionRule {
+  id: string;
+  /** Exactly one of role / userId is set, enforced by the schema and the API. */
+  role?: "admin" | "member";
+  userId?: string;
+  userEmail?: string;
+  /** Absent means every server. */
+  serverId?: string;
+  serverSlug?: string;
+  /** Absent means every tool on that server. Never set without a server. */
+  toolName?: string;
+  effect: "allow" | "deny";
+  createdAt: string;
+}
+
+/**
+ * What a user may actually call, as computed by the gateway's own decision function.
+ *
+ * The `reason` is the point: a tick with no explanation is not reviewable, and the
+ * precedence rules are hard enough to hold in your head that an admin needs to be told
+ * which rule decided rather than left to work it out.
+ */
+export interface EffectivePermissions {
+  user: { id: string; email: string; role: Role };
+  tools: { name: string; server: string; allowed: boolean; reason: string }[];
+}

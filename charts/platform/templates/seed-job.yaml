@@ -118,6 +118,16 @@ spec:
             # script so a malformed list fails the hook at deploy time.
             - name: SEED_UPSTREAMS
               value: {{ .Values.seed.upstreams | default list | toJson | quote }}
+            {{/*
+            The starting permission policy, as JSON (9.1).
+            
+            Same shape as SEED_UPSTREAMS and for the same reason: the seed Job validates it with
+            zod and fails loudly on a malformed entry, so a typo is a failed Job rather than a
+            policy that silently matches nobody - which is the worst failure for a permission
+            seed, because the system then looks configured and is not.
+            */}}
+            - name: SEED_PERMISSIONS
+              value: {{ .Values.seed.permissions | default list | toJson | quote }}
             - name: UPSTREAM_ALLOWLIST
               value: {{ join "," .Values.gateway.upstreamAllowlist | quote }}
             - name: SEED_MEMBER_PASSWORD

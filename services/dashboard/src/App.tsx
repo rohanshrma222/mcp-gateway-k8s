@@ -22,6 +22,7 @@ import { Servers } from './routes/Servers.js';
 import { Audit } from './routes/Audit.js';
 import { Tools } from './routes/Tools.js';
 import { Chat } from './routes/Chat.js';
+import { Permissions } from './routes/Permissions.js';
 import { Members } from './routes/Members.js';
 import { Keys } from './routes/Keys.js';
 
@@ -81,6 +82,7 @@ function Tree() {
         <Route path="servers" element={<Servers />} />
         <Route path="tools" element={<Tools />} />
         <Route path="members" element={<Members />} />
+        <Route path="permissions" element={<Permissions />} />
         <Route path="keys" element={<Keys />} />
         <Route path="audit" element={<Audit />} />
         <Route path="chat" element={<Chat />} />

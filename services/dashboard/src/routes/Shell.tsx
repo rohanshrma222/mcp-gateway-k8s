@@ -41,6 +41,7 @@ const NAV: NavItem[] = [
   { to: '/servers', label: 'Servers', roles: ['admin'] },
   { to: '/tools', label: 'Tools', roles: ['admin', 'member'] },
   { to: '/members', label: 'Members', roles: ['admin'] },
+  { to: '/permissions', label: 'Permissions', roles: ['admin'] },
   { to: '/keys', label: 'API keys', roles: ['admin', 'member'] },
   { to: '/audit', label: 'Audit', roles: ['admin', 'member'] },
   { to: '/chat', label: 'Chat', roles: ['admin', 'member'] },

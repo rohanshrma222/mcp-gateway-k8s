@@ -223,6 +223,66 @@ seed:
       url: http://upstreams-everything-mcp.mcp-upstreams.svc.cluster.local:3000/mcp
       authType: none
       timeoutMs: 5000
+
+  # The starting permission policy (9.1). Stand-out area #2.
+  #
+  # The gateway DENIES a tool call when no rule matches, so this list is what makes the
+  # system usable. An empty list means every call is refused - which presents as "the agent
+  # has no tools", a symptom nobody connects to a missing policy, so the seed logs a warning
+  # saying exactly that.
+  #
+  # Seeded with ON CONFLICT DO NOTHING, so this is a STARTING POINT and not an authority.
+  # An admin who revokes members' access to the store keeps that decision through the next
+  # `helm upgrade`, exactly as a disabled upstream survives one. Reasserting the file every
+  # deploy would silently undo deliberate changes, which is worse than drift.
+  #
+  # Precedence is specificity first, then subject:
+  #   user+server+tool > role+server+tool > user+server > role+server > user > role > deny
+  # So a targeted deny on one dangerous tool is not undone by a broad allow, and between two
+  # equally specific rules the one naming a person wins over the one naming their role.
+  #
+  # subject: `role:admin`, `role:member`, or `user:someone@example.com`
+  # server:  an upstream slug; omit for every server
+  # tool:    the upstream's own tool name, unprefixed; requires `server`
+  permissions:
+    # Admins may call everything, including upstreams registered later. Without this rule
+    # an admin who adds a server cannot use the server they just added.
+    - subject: role:admin
+      effect: allow
+
+    # Members: read-only, expressed as allow-the-server then deny-the-writes.
+    #
+    # Deny-by-tool rather than allow-by-tool, deliberately. Listing the reads would mean a
+    # tool added by an upstream later is invisible to members until someone notices - which
+    # is the safe direction but makes the policy quietly wrong over time. Listing the writes
+    # means a NEW write tool would be callable by members until it is added here, which is
+    # the unsafe direction, so the trade is stated rather than assumed: the upstreams here
+    # are ours or pinned, their tool sets change only when we change them, and the Tools
+    # page shows a member exactly what they can call. A deployment adding third-party
+    # upstreams freely should invert this.
+    - subject: role:member
+      server: woo
+      effect: allow
+    - subject: role:member
+      server: woo
+      tool: create_product
+      effect: deny
+    - subject: role:member
+      server: woo
+      tool: update_order_status
+      effect: deny
+
+    # The team notes server. add_note is a write and members may do it: notes are the one
+    # thing in this system a member is expected to create, and the brief's own member story
+    # is "save a note about today's orders".
+    - subject: role:member
+      server: notes
+      effect: allow
+
+    # everything-mcp is a third-party test server. Admins get it through their blanket rule;
+    # members get no rule at all, so default-deny applies. That is the demonstration of
+    # default-deny being the right choice: a server nobody has reviewed is not reachable by
+    # everyone the moment it is registered.
   backoffLimit: 3
   resources:
     requests: { cpu: 50m, memory: 96Mi }
