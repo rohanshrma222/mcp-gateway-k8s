@@ -34,3 +34,18 @@ gateway:
 ingress:
   tls:
     enabled: false
+
+# The chat agent (stage 8), pointed at a Secret created by hand in the cluster:
+#
+#   kubectl create secret generic urumi-groq -n urumi-platform #     --from-literal=groq-api-key=gsk_...
+#
+# Here rather than passed as --set on every deploy, which is how it was being done until 9.5
+# noticed. The prod-parity check compares the local and prod renders field by field, and the
+# difference it reported was not a bug in either overlay - it was that LOCAL DID NOT ENABLE A
+# FEATURE PROD DID, so three objects differed in shape for no reason anybody intended. A
+# --set that has to be remembered is not configuration, it is a step.
+#
+# An external Secret rather than secrets.groqApiKey, so the key never enters a values file,
+# and the same mechanism prod uses - which is the point of having it agree.
+secrets:
+  groqExistingSecret: urumi-groq

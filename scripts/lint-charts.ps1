@@ -158,6 +158,35 @@ foreach ($name in $Chart) {
     }
 }
 
+# ------------------------------------------------------------------------------------------
+# The full rendered diff, which this script's docstring promised stage 9 would add.
+#
+# The (kind, name) comparison above is a tripwire and stays - it is cheap and runs per chart.
+# verify-prod-parity.mjs is the real proof: it parses both renders through kubectl and
+# compares the FIELD PATHS of every shared object, so "only config changed" becomes a
+# mechanical claim rather than an assertion. Differences that are themselves configuration -
+# the TLS block, the cert-manager annotation, externally managed Secrets, a disabled
+# component - are declared there with reasons, and anything undeclared fails.
+#
+# Node rather than PowerShell because the comparison needs real JSON, and kubectl emits it.
+# ------------------------------------------------------------------------------------------
+if (-not $Chart) {
+    Write-Head 'Production parity'
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & node (Join-Path $PSScriptRoot 'verify-prod-parity.mjs')
+        if ($LASTEXITCODE -ne 0) {
+            Write-Fail 'verify-prod-parity.mjs reported a structural difference'
+        } else {
+            Write-Ok 'values-prod.yaml changes configuration only'
+        }
+    }
+    finally { $ErrorActionPreference = $previous }
+} else {
+    Write-Info 'parity check skipped: it compares all three charts, so run without -Chart'
+}
+
 Write-Head 'Result'
 if ($failures -eq 0) {
     Write-Host "all charts lint and render cleanly against both overlays" -ForegroundColor Green
