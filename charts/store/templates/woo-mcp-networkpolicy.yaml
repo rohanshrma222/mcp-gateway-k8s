@@ -27,8 +27,16 @@ spec:
   # here as well would break DNS for every workload at once, and the egress rules below
   # are written per component where the allowed destinations are actually known.
   podSelector: {}
+  # Egress added in the 9.4 sweep, and this namespace is the one where it cost something.
+  #
+  # Before it, only woo-mcp had an egress policy, so MariaDB, WordPress and the bootstrap hook
+  # all had unrestricted outbound access. Closing that needed three new allow rules below -
+  # including one for the bootstrap Job to reach the public internet, because it installs the
+  # WooCommerce plugin from wordpress.org. That is a genuine hole with a genuine reason, and it
+  # is narrow: one Job, one direction, and the private ranges excepted.
   policyTypes:
     - Ingress
+    - Egress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -108,3 +116,167 @@ spec:
           port: {{ .containerPort }}
         {{- end }}
 {{- end }}
+---
+{{/*
+MariaDB egress: DNS only.
+
+A database server initiates nothing. DNS is allowed because the entrypoint and client
+libraries resolve names; the absence of anything else is the point, and if MariaDB ever
+opens an outbound connection it should fail.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.mariadb.name" . }}-egress
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "mariadb") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "mariadb") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{/*
+WordPress egress: its database and DNS.
+
+**And deliberately NOT the internet**, which is a real trade rather than an oversight.
+WordPress phones api.wordpress.org for update checks, plugin metadata and news feeds. With
+this policy those calls fail, which makes parts of wp-admin slower while it waits for them
+and leaves the update panel empty. The storefront, checkout and REST API are unaffected,
+because none of them is outbound.
+
+That is the right default for a store whose plugins are installed once by the bootstrap hook:
+an application that cannot reach the internet cannot be used to reach the internet, and
+WordPress is the single most-attacked piece of software in this cluster. A deployment that
+wants live update checks should add a rule rather than remove this one.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "store.wordpress.name" . }}-egress
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "wordpress") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "wordpress") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "mariadb") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3306
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{/*
+The bootstrap hook: its database, WordPress, DNS - and the public internet.
+
+The internet rule is the one thing in this chart that genuinely widens the posture, so it is
+worth being exact about why. The hook runs `wp plugin install woocommerce --activate`, which
+downloads a zip from downloads.wordpress.org. Without egress it fails, and a fresh install
+produces a WordPress with no WooCommerce - which is most of the assignment.
+
+Narrowed three ways. It applies only to the bootstrap Job, which exists for seconds during an
+install or upgrade and is gone. It allows 443 and 80 only. And every private range is
+excepted - RFC1918, loopback, link-local including 169.254.169.254, and CGNAT - so a
+compromised plugin download cannot turn the hook into a way into the cluster or onto the host
+network. That except-list is the same one 4.6’s SSRF guard rejects and the same one the
+gateway’s model-provider rule uses, so all three agree on what "internal" means.
+
+The alternative - baking WooCommerce into a custom WordPress image - would remove this rule
+entirely and is what a production deployment should do. It is recorded as the better answer
+rather than implemented, because it trades a NetworkPolicy exception for a container image to
+build, version and patch.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "common.fullname" . }}-bootstrap-egress
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "bootstrap") | nindent 4 }}
+  annotations:
+    # Kept across the hook's lifecycle: the policy has to exist before the Job pod starts,
+    # and a hook-scoped object would race it.
+    helm.sh/resource-policy: keep
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "bootstrap") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "mariadb") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 3306
+    {{/*
+    There is deliberately NO rule here for bootstrap -> wordpress over HTTP.
+    
+    The first version of this policy had one, and probing it showed port 80 refused anyway:
+    WordPress ingress admits Traefik and woo-mcp, not the hook. Which is correct, because the
+    hook does not use HTTP - wp-cli operates on the shared wp-content volume and talks to
+    MariaDB directly. So the rule granted nothing and was removed.
+    
+    Worth removing rather than leaving: a rule that appears to permit a path which is refused
+    elsewhere is misleading documentation, and the next reader would reasonably conclude the
+    hook calls WordPress over HTTP.
+    */}}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80

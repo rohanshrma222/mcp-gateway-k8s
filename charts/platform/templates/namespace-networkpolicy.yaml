@@ -1,0 +1,170 @@
+{{/*
+The namespace-wide default-deny for urumi-platform, and the egress rules it makes necessary.
+
+This is the item `postgres-networkpolicy.yaml` deferred with "the namespace-wide default-deny
+for this namespace arrives in the stage 9 security sweep". It arrives here.
+
+**What was actually wrong, measured rather than assumed.** Before this file, urumi-platform
+had three policies, each selecting one component by label. A NetworkPolicy makes the pods it
+SELECTS default-deny for the directions it names - and selects nothing else. So any pod in
+this namespace without one of those three component labels had unrestricted egress. That is
+not hypothetical: it covers the migration Job and the seed Job, both of which run against the
+real database on every install and upgrade.
+
+Demonstrated with an unlabelled pod in this namespace: `curl http://1.1.1.1` returned **301**.
+Straight out to the internet, no policy in the way. The in-cluster destinations happened to
+refuse it, but only because each of THEM has an ingress policy - the probe pod itself was
+unconstrained, and a destination's policy is not a property of the source.
+
+So the fix is the namespace-wide commitment, both directions, plus an explicit egress rule for
+every pod that now needs one. Writing those rules is the work, and the list below is the
+complete set of outbound connections this namespace makes:
+
+  postgres   -> kube-dns          name resolution only; it is a server and calls nothing
+  migrations -> postgres, kube-dns  the schema Job
+  seed       -> postgres, kube-dns  the bootstrap Job
+
+The gateway and dashboard already have their own egress policies and are untouched.
+
+**The thing to be careful about**, learned in 3.5 and worth restating: a default-deny is a
+namespace-wide commitment, not a per-workload one. `podSelector: {}` selects every pod, so
+adding Egress here silently breaks anything whose outbound path is not enumerated - and for a
+Job that runs only during a deploy, "silently" means the next `helm upgrade` hangs rather than
+anything looking wrong today.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "common.fullname" . }}-default-deny
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "netpol") | nindent 4 }}
+spec:
+  # Every pod in the namespace, both directions, no rules: nothing in or out unless some
+  # other policy admits it.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+{{/*
+Postgres egress: DNS only.
+
+A database server connects to nothing. It needs name resolution because libpq and the
+container's own startup resolve hostnames, and allowing that costs nothing - but the absence
+of any other rule here is the interesting part, and it is deliberate: if the Postgres pod ever
+opens an outbound connection to anything, that is either a feature nobody mentioned or an
+exfiltration path, and it should fail.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "platform.postgres.name" . }}-egress
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "postgres") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "postgres") | nindent 6 }}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{/*
+The Jobs: Postgres and DNS, nothing else.
+
+Both the migration Job and the seed Job need exactly the database. The seed Job is the more
+interesting case, because 5.5 made a point of NOT resolving upstream URLs during seeding -
+the allowlist is checked as text and DNS is deliberately left alone. That decision is what
+makes this rule as narrow as it is: a seeder that validated upstreams by connecting to them
+would need egress to every namespace the registry might point at, which is most of the
+cluster.
+
+One policy covering both Jobs via matchExpressions rather than two near-identical ones,
+because they have identical requirements and two copies would drift the moment one changed.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "common.fullname" . }}-jobs-egress
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "netpol") | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - migrations
+          - seed
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "common.selectorLabels" (dict "root" $ "component" "postgres") | nindent 14 }}
+      ports:
+        {{- range .Values.postgres.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .containerPort }}
+        {{- end }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+{{/*
+Postgres ingress needs to admit the Jobs explicitly now.
+
+`postgres-networkpolicy.yaml` admits the gateway. The Jobs reached it before this file only
+because nothing was stopping them - there was no namespace-wide ingress deny covering
+Postgres, so its own policy was the only constraint and it listed the gateway. Adding the
+namespace-wide deny does not change that, but being explicit here means the Jobs' access is
+written down rather than inherited from a gap.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "platform.postgres.name" . }}-allow-jobs
+  labels:
+    {{- include "common.componentLabels" (dict "root" $ "component" "postgres") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "common.selectorLabels" (dict "root" $ "component" "postgres") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values:
+                  - migrations
+                  - seed
+      ports:
+        {{- range .Values.postgres.ports }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .containerPort }}
+        {{- end }}

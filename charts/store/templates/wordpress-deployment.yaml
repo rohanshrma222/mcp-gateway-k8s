@@ -182,7 +182,32 @@ spec:
             # only thing that survives a restart: plugins, themes and uploads.
             - name: wp-content
               mountPath: /var/www/html/wp-content
+            {{/*
+            What a read-only root filesystem takes away from Apache and PHP (9.4).
+            
+            The values exception said "Apache writes to /var/run and php-fpm to its session and
+            opcache directories, both outside the wp-content PVC" - which was accurate, unlike the
+            MariaDB one. The paths exist in the image and were confirmed on the running pod:
+            /var/run/apache2 and /var/lock/apache2 for the pid and mutex, and /tmp for PHP sessions
+            and the opcache file. /run/apache2 is a symlink to the first.
+            
+            So the exception was real and is now unnecessary: three emptyDirs cover it, and the root
+            can be read-only. The difference from MariaDB is worth noting - that reason was wrong and
+            this one was right, and both had to be checked rather than trusted.
+            */}}
+            - name: apache-run
+              mountPath: /var/run/apache2
+            - name: apache-lock
+              mountPath: /var/lock/apache2
+            - name: tmp
+              mountPath: /tmp
       volumes:
+        - name: apache-run
+          emptyDir: {}
+        - name: apache-lock
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
         - name: wp-core
           emptyDir: {}
         - name: wp-content

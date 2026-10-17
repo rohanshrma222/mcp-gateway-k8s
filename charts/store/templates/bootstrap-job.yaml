@@ -120,6 +120,17 @@ spec:
                   name: {{ include "store.wordpress.secretName" . }}
                   key: wordpress-app-password
           volumeMounts:
+            {{/*
+            The one writable path a read-only root takes away from wp-cli (9.4).
+            
+            The old exception read "wp-cli downloads core into an emptyDir and writes wp-config.php
+            there" - true, and not a reason the ROOT must be writable, because the emptyDir is a
+            mounted volume. What wp-cli actually needs on the root is ~/.wp-cli for its cache and
+            '/.wp-cli/cache/' - so one emptyDir at /tmp covers both the cache and the plugin zip it
+            unpacks. A separate home volume would have been redundant.
+            */}}
+            - name: tmp
+              mountPath: /tmp
             - name: scripts
               mountPath: /scripts
             # Core goes here and is discarded with the pod - it is scaffolding for wp-cli.
@@ -130,6 +141,8 @@ spec:
             - name: wp-content
               mountPath: /var/www/html/wp-content
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: scripts
           configMap:
             name: {{ include "store.wordpress.name" . }}-bootstrap

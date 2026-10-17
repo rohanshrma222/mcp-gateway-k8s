@@ -25,11 +25,22 @@ metadata:
   labels:
     {{- include "common.componentLabels" (dict "root" $ "component" "netpol") | nindent 4 }}
 spec:
-  # Empty podSelector means every pod in this namespace. Ingress only here; egress is
-  # declared per component below, where the allowed destinations are actually known.
+  # Empty podSelector means every pod in this namespace, BOTH directions.
+  #
+  # Egress was added in the 9.4 sweep. It said "Ingress only here; egress is declared per
+  # component below" - which was true and left a gap: a policy constrains only the pods it
+  # SELECTS, so a pod in this namespace without a component label had unrestricted egress.
+  # No such pod exists here today, and that is a fact about today rather than a property of
+  # the namespace: a debug container, a sidecar, or a future upstream whose policy somebody
+  # forgets would all land in the gap.
+  #
+  # Safe to tighten here because both components below already declare their egress, so
+  # this changes nothing that currently runs. The same change to store-default needed three
+  # new allow rules first.
   podSelector: {}
   policyTypes:
     - Ingress
+    - Egress
 ---
 {{- if .Values.notesMcp.enabled }}
 apiVersion: networking.k8s.io/v1

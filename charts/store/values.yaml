@@ -89,10 +89,16 @@ mariadb:
     - name: mysql
       containerPort: 3306
   securityContext:
-    # The entrypoint takes ownership of the data directory on first run, so the root
-    # filesystem cannot be read-only here. Stated in values rather than hidden in a
-    # template, so the exception is visible to whoever reviews this.
-    readOnlyRootFilesystem: false
+    # Read-only root, as of the 9.4 sweep. This was false, with the reason "the entrypoint
+    # takes ownership of the data directory on first run" - and that reason was WRONG. The
+    # chown runs against /var/lib/mysql, which is the PVC, and a read-only root filesystem
+    # does not stop a process writing to a mounted volume.
+    #
+    # What mariadb actually needs is /run/mysqld for its unix socket and pid file, and /tmp
+    # for temporary tables; both are emptyDir mounts in the StatefulSet now. Worth recording
+    # that the exception survived five stages behind a reason that did not hold - a
+    # documented exception is easier to trust than to re-examine.
+    readOnlyRootFilesystem: true
     runAsUser: 999
     runAsGroup: 999
     fsGroup: 999
@@ -142,9 +148,15 @@ wordpress:
       periodSeconds: 5
       failureThreshold: 60
   securityContext:
-    # Apache writes to /var/run and php-fpm to its session and opcache directories, both
-    # outside the wp-content PVC.
-    readOnlyRootFilesystem: false
+    # Read-only root, as of the 9.4 sweep. The old reason - "Apache writes to /var/run and
+    # php-fpm to its session and opcache directories, both outside the wp-content PVC" - was
+    # ACCURATE, unlike the MariaDB one. It just was not a reason the root had to be writable:
+    # /var/run/apache2, /var/lock/apache2 and /tmp are now emptyDir mounts, which covers all
+    # three writes.
+    #
+    # Both exceptions had to be checked rather than trusted, and they came out differently:
+    # MariaDB's reason did not hold at all, this one held and was still removable.
+    readOnlyRootFilesystem: true
     runAsUser: 33
     runAsGroup: 33
     fsGroup: 33
@@ -179,8 +191,12 @@ bootstrap:
     requests: { cpu: 50m, memory: 128Mi }
     limits: { cpu: '1', memory: 512Mi }
   securityContext:
-    # wp-cli downloads core into an emptyDir and writes wp-config.php there.
-    readOnlyRootFilesystem: false
+    # Read-only root, as of the 9.4 sweep. The old reason - "wp-cli downloads core into an
+    # emptyDir and writes wp-config.php there" - was true and was not a reason the ROOT had to
+    # be writable, since an emptyDir is a mounted volume. What wp-cli needs on the root is
+    # /tmp, and HOME is already set to /tmp, so a single emptyDir covers the download cache
+    # and the plugin zip it unpacks.
+    readOnlyRootFilesystem: true
     runAsUser: 33
     runAsGroup: 33
     fsGroup: 33

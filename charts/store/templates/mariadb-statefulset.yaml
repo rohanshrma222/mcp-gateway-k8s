@@ -77,8 +77,33 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/mysql
+            {{/*
+            The two writable paths a read-only root filesystem takes away (9.4).
+            
+            The values file said the root could not be read-only because "the entrypoint takes
+            ownership of the data directory on first run". That reason was WRONG: a chown runs
+            against /var/lib/mysql, which is the PVC, and a read-only root does not stop a process
+            writing to a mounted volume.
+            
+            What mariadb actually needs outside its PVC is somewhere for the unix socket and pid file
+            (/run/mysqld) and scratch space for temporary tables and sort files (/tmp). Both are
+            emptyDir: writable, node-backed, and gone with the pod.
+            
+            /run/mysqld matters more than it looks. The probes connect over the unix socket as
+            mysql@localhost precisely so they carry no credential, so losing that directory would
+            break readiness rather than merely some feature.
+            */}}
+            - name: run
+              mountPath: /run/mysqld
+            - name: tmp
+              mountPath: /tmp
   # Not templated behind a conditional: see the fail() above. The database always has a
   # volume.
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

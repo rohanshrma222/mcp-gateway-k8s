@@ -390,8 +390,30 @@ export class HealthProber {
           target.id,
           tool.name,
           buildToolName(target.slug, tool.name),
-          tool.title ?? null,
-          tool.description ?? null,
+          /**
+           * Capped at storage (9.4), which is the input-size sweep 7.5 and 8.2 both deferred
+           * here.
+           *
+           * `title`, `description` and the tool NAME are the only rendered values in this
+           * system a third party controls: 5.2 stores what an upstream publishes verbatim, and
+           * one of the three upstreams is software we did not write. Nothing capped them in
+           * zod, in the schema, or here - 7.5 measured a 4,000-character description taking
+           * `/api/tools` from 16.1 kB to 21.3, and a hostile upstream could publish megabytes.
+           *
+           * Capped HERE rather than at render, because the cost is not only visual: an
+           * uncapped description is stored forever, re-read on every `tools/list`, shipped to
+           * every MCP client, and - since 8.1 - sent to the model on every single chat turn,
+           * where tokens are the binding constraint. Truncating at the screen fixes none of
+           * that.
+           *
+           * 500 and 4,000: a title is a label and a description is a sentence or two. The
+           * longest legitimate description across the 21 live tools is 414 characters, so this
+           * leaves an order of magnitude of headroom and still bounds the damage. Truncated
+           * with a marker rather than silently, so a tool whose docs really are long reads as
+           * cut off rather than as having stopped mid-word.
+           */
+          truncateMetadata(tool.title, 500),
+          truncateMetadata(tool.description, 4000),
           // Stringified for jsonb. The schema and annotations are stored verbatim because
           // 5.4 forwards them to clients: rewriting them here would mean a client sees a
           // schema the upstream never published, and an argument that validates at the
@@ -464,4 +486,18 @@ function isUniqueViolation(error: unknown): boolean {
     'code' in error &&
     (error as { code: unknown }).code === '23505'
   );
+}
+
+/**
+ * Caps a third-party metadata string, marking it when it truncates.
+ *
+ * Returns null for absent, which is what the column wants - so the caller does not need a
+ * separate `?? null` and cannot forget one.
+ */
+function truncateMetadata(value: string | undefined, limit: number): string | null {
+  if (value === undefined) return null;
+  if (value.length <= limit) return value;
+  // The marker says the gateway did this, not the upstream. Without it, a reader debugging a
+  // confusing tool description would reasonably blame the upstream for the mangling.
+  return `${value.slice(0, limit)}... [truncated by the gateway at ${limit} characters]`;
 }
