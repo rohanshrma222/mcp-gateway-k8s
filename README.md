@@ -12,20 +12,11 @@ charts** and different values.
 
 ## Status
 
-This is built in stages. The table is the honest state of the repository, not the plan.
-
-| Stage | Scope | State |
-| --- | --- | --- |
-| 1 | Cluster, repo skeleton, NetworkPolicy proof, chart scaffolding | **done** |
-| 2 | Store: WordPress + WooCommerce + MariaDB, persistent | **done** |
-| 3 | WooCommerce MCP server (5 tools, Streamable HTTP) | **done** |
-| 4 | Gateway: identity, API keys, upstream registry | **done** |
-| 5 | Aggregation and the single `/mcp` endpoint | **done** |
-| 6 | Audit log + two more upstreams | **in progress** (5 of 6) |
-| 7 | Dashboard | not started |
-| 8 | Chat agent | not started |
-| 9 | Hardening, scale, production story | not started |
-| 10 | Docs, demo, submission | not started |
+Everything described below is built and running on a local kind cluster. The claims are
+checked by scripts rather than asserted - `verify-security.ps1` passes 71 checks,
+`verify-prod-parity.mjs` 12, and `verify-upgrade-rollback.ps1` 10, all with zero failures.
+What is **not** done is listed under [Known gaps, honestly](#known-gaps-honestly); the demo
+video is the one deliverable still outstanding.
 
 What works today, end to end on a local kind cluster:
 
@@ -46,17 +37,70 @@ What works today, end to end on a local kind cluster:
   third-party reference "everything" server, vendored as a pinned dependency rather than
   pulled as an image. None has an Ingress; all three are reachable only from the gateway.
 - Two gateway replicas, both serving `/mcp` with the same key, because the endpoint is
-  stateless. Stopping an upstream leaves `tools/list` working and returns a readable error
-  that names the server.
+  stateless - no session id is issued, which is checked rather than claimed. Stopping an
+  upstream leaves `tools/list` working and returns a readable error that names the server.
+- A **React dashboard** at `app.urumi.local` with seven working pages: servers (status with
+  the failure reason, add/edit/disable, a write-only credential field), tools, members,
+  permissions, API keys, the audit log, and chat.
+- An **in-dashboard chat agent** that calls tools as the signed-in user. It is an MCP
+  *client* to the gateway's own `/mcp`, holding a key minted for that one message and
+  revoked when it ends - so it is indistinguishable from an external client and cannot
+  exceed the person driving it. Every call is traced in the UI as
+  `called woo__list_orders (132ms, ok)` and recorded in the audit log with `actor=chat`.
+- **Per-tool permissions**: admins full, members read-only. A tool a user may not call is
+  both hidden from `tools/list` and refused on a direct call, decided by one function so
+  the two cannot disagree. No matching rule means refused.
+- **Per-key rate limiting**: a token bucket in Postgres - not in memory, because two
+  replicas would otherwise give each client its allowance twice - returning 429 with
+  `Retry-After`.
+- **An audit log** of every tool call with the user, server, tool, duration and outcome,
+  filterable in the dashboard and queryable with keyset pagination.
 
-The helper scripts: `scripts/bootstrap.ps1` builds the cluster and proves the ingress path;
-`scripts/verify-netpol.ps1` proves NetworkPolicy is enforced *and* selective;
-`scripts/lint-charts.ps1` lints and renders all three charts against both value overlays.
+### The scripts
 
-Not built yet: the React dashboard
-beyond a placeholder (stage 7), the chat agent (stage 8), and tool permissions and rate
-limits (stage 9). The audit log and its query API are done (stage 6); what remains there is
-Prometheus coverage of the new upstreams.
+Every claim this README makes has a script behind it, which is the point - a README is the
+easiest place in a repository to be out of date, and these fail rather than reassure.
+
+| Script | What it proves |
+| --- | --- |
+| `scripts/bootstrap.ps1` | builds the kind cluster, installs Calico and Traefik, proves the ingress path |
+| `scripts/deploy-local.ps1` | builds and loads all five images, deploys all three charts, forces a rollout so a code-only change actually ships |
+| `scripts/verify-netpol.ps1` | NetworkPolicy is enforced **and** selective - a deny that blocked everything would pass a one-sided test |
+| `scripts/verify-upstream-isolation.ps1` | five phases proving no upstream is reachable except from the gateway, every negative paired with a positive control |
+| `scripts/verify-security.ps1` | **71 checks**: non-root, read-only root, dropped capabilities, resource limits, default-deny in all three namespaces, no mounted API tokens, no RBAC, no literal secrets, probes, exactly two Ingress objects |
+| `scripts/verify-prod-parity.mjs` | **12 checks**: `values-prod.yaml` changes configuration only, compared field-path by field-path through kubectl's own parser |
+| `scripts/verify-upgrade-rollback.ps1` | **10 checks**: `helm upgrade` then `helm rollback` with every row, hash and PVC uid unchanged |
+| `scripts/lint-charts.ps1` | lints and renders all three charts against both overlays, then runs the parity proof |
+
+All three verification gates are green as of the last run: security 71/0, parity 12/0,
+upgrade/rollback 10/0.
+
+### Known gaps, honestly
+
+Stated here rather than left to be discovered:
+
+- **Never deployed to a real k3s VPS.** `verify-prod-parity.mjs` proves the manifests differ
+  only in configuration and `values-prod.yaml` carries an executable secret runbook, but a
+  template diff is not a deploy. Renting a server was out of scope from the plan onward.
+- **Prometheus and Grafana are not deployed.** The gateway exposes `/metrics` with
+  `prom-client` and the series are there; nothing scrapes them, and there are no alert
+  rules.
+- **Chat sidesteps the rate limit.** The bucket is per key and a key is minted per message,
+  so every message starts with a full allowance. Per-key was the specification and this is
+  the gap between it and the intention; the fix is a per-user bucket and needs a schema
+  change.
+- **Prompt-injection defence reduces accidents, it is not a wall.** A note-body injection
+  was reported to the user rather than obeyed; a hostile *tool description* succeeded until
+  a structural check was added, and that check is a substring match on tool names - an
+  oblique reference would not trip it. What bounds a success is the architecture, not the
+  prompt.
+- **The schema does not roll back.** Migrations are forward-only. Safe for all nine here,
+  which are additive; not safe for one that dropped a column.
+- **Postgres is a single replica with no replication**, and the dashboard runs one pod. The
+  gateway scales horizontally and its state does not.
+- **No browser testing.** The dashboard and chat were verified against API payloads, the shipped
+  bundle inside the running pod and the CSS. The pages serve and the event contract is
+  checked; nothing has been looked at by a human.
 
 ---
 
@@ -220,7 +264,55 @@ negative has a control check beside it, so "blocked" can never be confused with 
 
 ## Deploy to a k3s VPS
 
-*Planned — Stage 9. The charts are already structured for it.*
+The same three charts with `values-prod.yaml`. **Proved config-only**, not asserted:
+`node scripts/verify-prod-parity.mjs` renders both overlays, parses them through kubectl,
+and compares the field paths of every shared object - 12 checks, 0 failures. Differences
+that are themselves configuration (the TLS block, the cert-manager annotation, externally
+managed Secrets, the disabled reference server) are declared there with reasons, and
+anything undeclared fails.
+
+Four Secrets have to exist before the platform chart installs. The commands, with the
+consequence of each rotation, are in `charts/platform/values-prod.yaml` next to the names
+the chart reads - the short version:
+
+```bash
+kubectl create namespace urumi-platform
+
+# Rotating this logs everyone out and does nothing worse.
+kubectl -n urumi-platform create secret generic urumi-jwt \
+  --from-literal=jwt-secret="$(openssl rand -base64 36 | tr -d =)"
+
+# ROTATING THIS DESTROYS every stored upstream credential - they are encrypted under it
+# and the PVC outlives the release. Back it up somewhere that is not the cluster.
+kubectl -n urumi-platform create secret generic urumi-encryption \
+  --from-literal=encryption-key="$(openssl rand -base64 24 | tr -d =)"
+
+# Omit this entirely to run without the chat agent: POST /api/chat answers 503 and
+# everything else works.
+kubectl -n urumi-platform create secret generic urumi-groq \
+  --from-literal=groq-api-key=gsk_...
+
+# The seed Job is idempotent, so changing a password here does NOT rotate an existing
+# account - change it in the dashboard instead.
+kubectl -n urumi-platform create secret generic urumi-bootstrap \
+  --from-literal=admin-email=admin@example.com \
+  --from-literal=admin-password="$(openssl rand -base64 18)" \
+  --from-literal=member-email=member@example.com \
+  --from-literal=member-password="$(openssl rand -base64 18)"
+```
+
+Then the same three charts in the same order, with the prod overlay:
+
+```bash
+helm upgrade --install store-default charts/store  -n store-default  --create-namespace -f charts/store/values-prod.yaml
+helm upgrade --install upstreams    charts/upstreams -n mcp-upstreams --create-namespace -f charts/upstreams/values-prod.yaml
+helm upgrade --install platform     charts/platform -n urumi-platform --create-namespace -f charts/platform/values-prod.yaml
+```
+
+One setting differs on a single-node VPS and is worth knowing about:
+`gateway.topologySpreadStrictness` stays `ScheduleAnyway` in production. On the three-node
+local cluster it is `DoNotSchedule`, which genuinely spreads the two replicas across nodes;
+requiring that on one node would leave the second replica `Pending` forever.
 
 The same three charts, with `values-prod.yaml` instead of `values-local.yaml`. Nothing
 structural differs; `scripts/lint-charts.ps1` compares the set of objects each overlay
@@ -243,14 +335,12 @@ controller and one `ingressClassName`, so the "config changes only" property is 
 
 ## How to use it
 
-*These sections fill in as the stages land; each names the stage that delivers it.*
-
-### Place an order — *stage 2*
+### Place an order
 
 Open `http://store.urumi.local`, add a product to the cart, check out with Cash on
 Delivery, then confirm the order in `wp-admin`.
 
-### Connect an external MCP client — *stage 5*
+### Connect an external MCP client
 
 The WooCommerce server is already registered on a fresh install, so the only thing you need
 is a key. Issue one as the seeded admin:
@@ -300,12 +390,39 @@ Every tool from every enabled upstream appears under this one endpoint, namespac
 A revoked key is refused on the next call, and disabling a server removes its tools from
 `tools/list` *and* refuses a call that names one.
 
-### Use the chat agent — *stage 8*
+### Use the chat agent
 
-Sign in to `http://app.urumi.local`, open Chat, and ask for something that needs a tool
-("create a product called X priced Y", "what orders came in today"). The agent connects to
-the gateway's own `/mcp` endpoint as the logged-in user, so every call is attributed to
-that person in the audit log — not to a service account.
+**First, a model key.** The chat agent is the one feature needing an external service. Make
+a free key at console.groq.com, then:
+
+```bash
+kubectl -n urumi-platform create secret generic urumi-groq \
+  --from-literal=groq-api-key=gsk_...
+```
+
+`values-local.yaml` already points at that Secret by name, so a redeploy picks it up.
+Without it `POST /api/chat` answers **503** with a sentence saying exactly that, and nothing
+else is affected — `GROQ_API_KEY` is the only optional secret in the gateway's config
+schema, so the platform runs perfectly well without a chat agent.
+
+Then sign in at `http://app.urumi.local`, open **Chat**, and ask for something needing a
+tool. Two prompts worth trying:
+
+- *"How many products are in the store?"* — one upstream, one tool call.
+- *"Check the orders in the store, then save a note recording how many there were."* — this
+  needs **two different upstreams in one answer**, which is the brief's own test.
+
+Every tool call appears inline as `called woo__list_orders (132ms, ok)` with the arguments
+the model chose, and lands in the audit log as `actor=chat` under your account — not a
+service account. Sign in as the member instead and ask it to create a product: it will say
+it has no such tool, because permissions filter what the agent is shown *and*
+refuse a direct call either way.
+
+**One practical note.** Groq's free tier allows 8,000 tokens a minute and a single turn
+costs about 3,100 — dominated by the 21 tool schemas rather than by the conversation. A
+tool-using exchange needs at least two turns, so expect roughly **one complete chat per
+minute** before it returns 429. The error is surfaced verbatim, including Groq's own "try
+again in 8s". Signing in as a member helps, since a member is sent 6 schemas instead of 21.
 
 ---
 
@@ -320,8 +437,14 @@ kind/cluster.yaml          cluster definition, k8s pinned by digest
 kind/calico-values.yaml    CNI values — NetworkPolicy enforcement
 kind/traefik-values.yaml   ingress controller values
 scripts/bootstrap.ps1      cluster + CNI + ingress + smoke test (idempotent)
-scripts/verify-netpol.ps1  gate: NetworkPolicy enforced *and* selective
-scripts/lint-charts.ps1    gate: deps + lint + render, both overlays
+scripts/deploy-local.ps1   build + load all 5 images, deploy all 3 charts, force the rollout
+scripts/verify-netpol.ps1              gate: NetworkPolicy enforced *and* selective
+scripts/verify-upstream-isolation.ps1  gate: no upstream reachable except from the gateway
+scripts/verify-security.ps1            gate: 71 posture checks against the live cluster
+scripts/verify-prod-parity.mjs         gate: values-prod.yaml changes configuration only
+scripts/verify-upgrade-rollback.ps1    gate: upgrade + rollback with no data loss
+scripts/lint-charts.ps1                gate: lint + render both overlays, then the parity proof
+scripts/dev/worst-case-data.sql        injects worst-case data to stress the dashboard
 charts/common/             Helm LIBRARY chart — the inherited workload rules
 charts/store/              mariadb + wordpress + woo-mcp (one release per store)
 charts/platform/           postgres + gateway + dashboard

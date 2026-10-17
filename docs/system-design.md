@@ -2,7 +2,7 @@
 
 How the system is put together, and — more usefully — what each choice cost.
 
-Sections describing components not yet built are marked **(planned)** and name the stage
+Everything described here is built and running. Section 11 is the honest list of what is not, and section 12 names the scripts that check the claims rather than restating them.
 that delivers them. This is a design document, so it describes the intended design in
 full; the honest build state is the table in [../README.md](../README.md).
 
@@ -83,7 +83,7 @@ per store without enumerating anything.
 
 ## 4. Request paths
 
-### 4.1 Storefront checkout **(planned — stage 2)**
+### 4.1 Storefront checkout
 
 ```
 browser → 127.0.0.1:80 → kind extraPortMapping → node :80 (hostPort)
@@ -91,7 +91,7 @@ browser → 127.0.0.1:80 → kind extraPortMapping → node :80 (hostPort)
         → MariaDB (order row)
 ```
 
-### 4.2 A tool call from an external client **(planned — stage 5)**
+### 4.2 A tool call from an external client
 
 ```
 Claude Code                                 gateway                    woo-mcp
@@ -116,7 +116,7 @@ Steps 1–5 all happen before anything leaves the gateway. The client's bearer t
 **never** forwarded upstream — it identifies the caller to us and means nothing to woo-mcp.
 Forwarding it would make the gateway a confused deputy.
 
-### 4.3 The chat agent **(planned — stage 8)**
+### 4.3 The chat agent
 
 The agent does not get a privileged internal path. It mints a short-lived, user-scoped API
 key and connects to the gateway's **own** `/mcp` over loopback — the identical code path an
@@ -289,7 +289,7 @@ rendered output shows a fresh value each time and a template diff reports those 
 changed when nothing has. Production therefore supplies secrets out of band via
 `existingSecret` and does not rely on generation at all.
 
-## 7. Data model **(planned — stage 4)**
+## 7. Data model
 
 | Table | Purpose | Notes |
 | --- | --- | --- |
@@ -312,12 +312,36 @@ Rate limits are per-key token buckets in Postgres rather than in memory, specifi
 two replicas cannot each grant a full quota. A PodDisruptionBudget keeps one replica
 serving through a node drain.
 
+**What measuring that actually produced**, because three of the four claims above were
+not true when first checked:
+
+- Both replicas were scheduled on the **same node**. The spread constraint was
+  `whenUnsatisfiable: ScheduleAnyway`, which is a preference the scheduler weighs against
+  everything else and loses. Two replicas on one node survive a pod failure and not a node
+  failure, which is most of the reason for two. The strictness is now a value:
+  `DoNotSchedule` locally where three nodes can satisfy it, `ScheduleAnyway` in production
+  where one node cannot.
+- Requiring the spread then **deadlocked the rollout**. A spread constraint counts every
+  pod matching its selector, including the outgoing ReplicaSet’s, so with two schedulable
+  nodes and `maxSurge: 1` the surge pod could never be placed. Fixed with
+  `matchLabelKeys: [pod-template-hash]`, which scopes the skew per revision. Worth
+  remembering that this cannot happen on a first install - there is no old ReplicaSet to
+  collide with - so a constraint that is correct on `helm install` hangs the upgrade after
+  it.
+- A rolling restart **dropped 3 requests of 276**. Not a bad shutdown: Kubernetes sends
+  SIGTERM and removes the pod from the Service endpoints concurrently, so the ingress
+  still routes to a pod that has begun draining. A `preStop` sleep of 5s inverts the
+  order. Re-measured: **412 of 412 succeeded**.
+- Statelessness held without change: `initialize` returns **no** `Mcp-Session-Id`, and 30
+  calls from one client split **75 / 136** across the two pods with 31 audit rows all
+  `ok`.
+
 Stateful components do not scale horizontally and are not pretended to: MariaDB and
 Postgres are single-replica StatefulSets with PVCs. WordPress stays at one replica in
 production because `local-path` on a single-node VPS is node-local, not RWX — stated rather
 than quietly assumed.
 
-## 9. Failure modes **(planned — stages 5, 6, 9)**
+## 9. Failure modes
 
 | Failure | Behaviour |
 | --- | --- |
@@ -329,6 +353,44 @@ than quietly assumed.
 | Postgres unavailable | gateway fails `/readyz` and leaves its Service; the storefront is unaffected — different namespace, different database |
 | Malformed LLM tool call | the tool error is returned to the model, which may retry; the loop is capped |
 | Rate limit exhausted | `429` with `Retry-After` |
+
+## 9a. The permission model
+
+A rule in `tool_permissions` names a **subject** - a role or a single user, never both,
+enforced by a CHECK constraint - and a **scope**: everything, one server, or one tool on
+one server. A bare tool name is rejected by the schema, because this system deliberately
+ships two tools called `list_products` and a name alone does not identify one.
+
+Precedence is **specificity first, then subject**:
+
+```
+user+tool  >  role+tool  >  user+server  >  role+server  >  user  >  role  >  DENY
+```
+
+The alternative - subject first, so any user-level rule beats any role-level one - was
+rejected on a single example. With `user=alice -> allow everything` and
+`role=member + create_product -> deny`, subject-first lets Alice create products: a broad
+convenience grant undoing a narrow deliberate deny. Specificity-first reads as "the
+narrowest rule about the thing you are doing wins, and between two equally narrow rules the
+one naming you personally wins".
+
+The precedence lives in the `ORDER BY` of a LATERAL subquery, so it exists once and
+`tools/list` stays a single query regardless of how many rules there are.
+
+**No matching rule means refused.** The cost is real: register a new upstream and nobody
+can call it until a rule exists. The seeded policy grants admins everything, so whoever
+registered it can use it and extending access to members is a deliberate act. The reason is
+situational rather than a general preference for deny - upstreams here are registered **at
+runtime, through an API, by an admin typing a URL**, so under default-allow the instant
+anyone adds a server every member can call everything it exposes, including writes nobody
+has reviewed.
+
+**One function decides, and both paths use it.** `tools/list` filters with it and
+`tools/call` asks it about one tool. Two implementations would drift, and the two failure
+modes are not equally visible: visible-but-uncallable is loud, while hidden-but-callable is
+silent *and undetectable by testing through the UI*, because the UI never asks for the tool
+it was not shown. The call-path check also runs **before** the upstream credential is
+decrypted, so a refusal opens no connection and reveals nothing about reachability.
 
 ## 10. Local → production
 
@@ -350,6 +412,29 @@ and woo-mcp authenticates to the WooCommerce REST API with one. In production it
 over plain HTTP it falls back to OAuth 1.0a, which is the documented alternative if
 Application Passwords were unavailable.)
 
+## 12. How the claims in this document are checked
+
+Every structural claim above has a script behind it, because a design document is the
+easiest place in a repository to be confidently out of date. These fail rather than
+reassure, and all three were green at the last run.
+
+| Script | Claim it checks | Result |
+| --- | --- | --- |
+| `verify-netpol.ps1` | NetworkPolicy is enforced **and** selective | pass |
+| `verify-upstream-isolation.ps1` | no upstream is reachable except from the gateway, every negative paired with a positive control | pass |
+| `verify-security.ps1` | non-root, read-only root, dropped capabilities, resource limits, default-deny in all three namespaces, no mounted API tokens, no RBAC, no literal secrets, probes, exactly two Ingress objects | **71 checks, 0 failures** |
+| `verify-prod-parity.mjs` | `values-prod.yaml` changes configuration only, field path by field path | **12 checks, 0 failures** |
+| `verify-upgrade-rollback.ps1` | upgrade then rollback with every row, hash and PVC uid unchanged | **10 checks, 0 failures** |
+
+The parity check deserves a note on what it means, because the obvious reading is wrong.
+"Only config changed" does not mean the two renders are identical - they must differ, or
+the overlay does nothing. It means **no object has a different shape**: the same objects,
+each with the same containers, volumes, mounts, probes and fields, with only the leaf
+values differing. So it compares field *paths* rather than values, and differences that are
+themselves configuration - the TLS block, the cert-manager annotation, externally managed
+Secrets, the disabled reference server - are declared with reasons. Anything undeclared
+fails.
+
 ## 11. Known gaps and what I would build next
 
 - **Multi-store provisioning** (the bonus) is out of the twelve-day scope.
@@ -360,5 +445,22 @@ Application Passwords were unavailable.)
   and reviewable; actually renting a VPS is about a one-day add-on.
 - **Single-replica datastores.** Correct for this scope; a real deployment wants replication
   and a tested restore, not just a PVC.
-- **`lint-charts.ps1` compares object sets, not full rendered output.** A tripwire for
-  structural drift, not a diff. Stage 9 replaces it with a real one.
+- **Prometheus and Grafana are not deployed.** The gateway exposes `/metrics` with
+  `prom-client` and the series exist - tool calls by outcome, a duration histogram, upstream
+  up/down, tool counts per server, probe freshness, audit-write failures, swept chat keys -
+  but nothing scrapes them and there are no alert rules. The series were chosen so that a
+  stalled prober is visible (a freshness timestamp, not a counter), which is the part that
+  needed thinking about; wiring a scraper is configuration.
+- **Chat sidesteps the rate limit.** The bucket is keyed on the API key and a key is minted
+  per chat message, so every message starts with a full allowance. Per-key was the
+  specification and this is the gap between it and the intention. The fix is a per-user
+  bucket, which needs a schema change and carries a real question with it: should a person’s
+  chat and their external client share one allowance or have separate ones?
+- **Prompt-injection defence reduces accidents; it is not a boundary.** A note-body injection
+  was reported to the user rather than obeyed, twice. A hostile tool *description* succeeded
+  until a structural check was added - and that check is a substring match on tool names, so
+  an oblique reference would not trip it. What bounds a success is the architecture: the agent
+  holds an ordinary key through the ordinary path, so it cannot exceed the user driving it.
+- **No browser testing.** The dashboard and chat were verified against API payloads, the shipped
+  bundle inside the running pod, and the CSS. The pages serve and the SSE event contract is
+  checked against the code that consumes it; nothing has been looked at by a human.
