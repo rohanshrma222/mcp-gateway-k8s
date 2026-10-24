@@ -136,6 +136,10 @@ attribution is not a special case that could silently be wrong.
 | notes-mcp | built here | `/readyz`, `/healthz` | PVC 1Gi | no |
 | everything-mcp | pinned Dockerfile around the npm package | `/readyz`, `/healthz` | none | no |
 
+`woo-mcp` reaches WordPress over the WooCommerce REST API (`wc/v3`) with a mounted
+application password; [6.13](#613-woo-mcp-reaches-the-store-over-the-woocommerce-rest-api-not-wp-cli)
+says why that rather than WP-CLI, and what it costs.
+
 ## 6. Design decisions and what the alternative would have cost
 
 ### 6.1 Stateless Streamable HTTP for the gateway's MCP server
@@ -288,6 +292,61 @@ Volunteered caveat: `lookup` returns empty during `helm template` and `--dry-run
 rendered output shows a fresh value each time and a template diff reports those keys as
 changed when nothing has. Production therefore supplies secrets out of band via
 `existingSecret` and does not rely on generation at all.
+
+### 6.13 woo-mcp reaches the store over the WooCommerce REST API, not WP-CLI
+
+`woo-mcp` calls `/wp-json/wc/v3/products` and `/wp-json/wc/v3/orders` over HTTP Basic,
+authenticating with a WordPress **Application Password** mounted as a file at
+`/etc/woo-mcp/credentials/app-password` and re-read when its mtime changes, so rotating the
+Secret needs no restart.
+
+WP-CLI is not absent from the system — the post-install/post-upgrade bootstrap hook is a
+WP-CLI script (`charts/store/templates/bootstrap-configmap.yaml`) that installs core,
+activates WooCommerce, sets permalinks, enables Cash on Delivery and issues the application
+password. The split is deliberate: **WP-CLI provisions the store once, REST operates it
+continuously.** They are different jobs with different trust requirements.
+
+**Alternative:** have the MCP server drive WP-CLI for the tool calls too.
+
+**Cost:** WP-CLI is a *local* tool. It needs the WordPress filesystem and the database
+credentials in its own process, and woo-mcp is a separate Deployment. That leaves two ways
+to do it and both are worse:
+
+- *Put WP-CLI in woo-mcp.* The container grows PHP, WordPress core and a direct MariaDB
+  credential. The MCP server stops being a client of the store and becomes a second writer
+  to its database, with a credential far broader than the five tools need.
+- *`kubectl exec` into the WordPress pod.* This needs a ServiceAccount with `pods/exec`,
+  which is one of the broadest verbs in Kubernetes — it is arbitrary code execution inside
+  the target pod. Today **no workload in this system talks to the Kubernetes API at all**,
+  no pod mounts a service-account token, and `scripts/verify-security.ps1` asserts both.
+  That property would be traded away for a transport choice.
+
+Three more things REST buys that a database-level tool does not:
+
+- **WooCommerce's own logic runs.** `update_order_status` is required to have real effects:
+  WooCommerce sends the customer the email for the new status and adjusts stock on
+  cancelled/refunded. A direct write sets a column and silently skips both, which looks
+  like it worked.
+- **A bounded, revocable credential.** An application password is scoped to one WordPress
+  user, visible in wp-admin, and revocable there without touching the database. The WP-CLI
+  equivalent is the database credential, which cannot be scoped or revoked per consumer.
+- **It scales and it is typed.** `wooMcp.replicas: 2` in production is only coherent for a
+  stateless HTTP client; a CLI shelling into one WordPress pod is not. And `wc/v3` is a
+  versioned JSON contract rather than stdout to be parsed.
+
+**What it costs us,** stated rather than discovered:
+
+- WordPress serves Application Passwords over plain HTTP **only** when
+  `wp_get_environment_type()` returns `local`. That is why `wordpress.environmentType` is
+  the single most load-bearing value in the local overlay, and why production sets
+  `production` and runs TLS end to end. WP-CLI would have sidestepped the whole question.
+  (WooCommerce's own Basic auth requires SSL; over plain HTTP it falls back to OAuth 1.0a,
+  the documented alternative had Application Passwords been unavailable.)
+- A tool call pays an HTTP hop plus a full WordPress bootstrap, where WP-CLI would have
+  paid one query. Irrelevant at this scale and worth knowing.
+- The REST surface is smaller than WP-CLI's. All five required tools map onto `wc/v3`
+  cleanly; a future tool needing something WooCommerce does not expose there would need a
+  different answer rather than an extra flag.
 
 ## 7. Data model
 

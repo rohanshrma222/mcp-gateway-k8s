@@ -75,6 +75,37 @@ easiest place in a repository to be out of date, and these fail rather than reas
 All three verification gates are green as of the last run: security 71/0, parity 12/0,
 upgrade/rollback 10/0.
 
+### Bonus and stand-out items: what was attempted, and where
+
+The brief asks for this list explicitly. Five of the nine stand-out areas are implemented;
+the bonus and four others are not, and saying so plainly is cheaper than letting someone
+look for them.
+
+**Attempted**
+
+| # | Area | Where it lives |
+| --- | --- | --- |
+| 2 | **Tool permissions** | `services/gateway/src/auth/permissions.ts` (one `decide()` used by *both* listing and calling), schema `charts/platform/migrations/004_tool_permissions.sql`, API `services/gateway/src/routes/permissions.ts`, UI `services/dashboard/src/routes/Permissions.tsx`, design `docs/system-design.md` §9a |
+| 6 | **Security hardening** | SSRF guard on admin-supplied URLs `services/gateway/src/security/ssrf.ts`; upstream credentials AES-256-GCM at rest `services/gateway/src/crypto/credentials.ts`; default-deny NetworkPolicies `charts/*/templates/*-networkpolicy.yaml`; non-root, read-only root, dropped capabilities `charts/common/templates/_security.tpl`; gate `scripts/verify-security.ps1` (71 checks) |
+| 7 | **Scaling** | two gateway replicas serving one stateless `/mcp` — no session id is issued (`docs/system-design.md` §6.1); per-key token-bucket rate limiting in Postgres rather than memory, `services/gateway/src/auth/rateLimit.ts` + `migrations/005_rate_buckets.sql` |
+| 8 | **Observability** | `services/gateway/src/metrics.ts` (`prom-client`: tool calls, error rate, latency and up/down per server); why an upstream is unreachable is recorded as a reason string by `services/gateway/src/mcp/prober.ts` and shown on the servers page |
+| 9 | **Upgrades and rollback** | `scripts/verify-upgrade-rollback.ps1` — `helm upgrade` then `helm rollback` with every row, password hash and PVC uid unchanged (10 checks); narrative in [Deploy to a k3s VPS](#deploy-to-a-k3s-vps) and `docs/demo-script.md` §7 |
+
+On **least-privilege RBAC** (part of #6): the strongest form available was to need none.
+No workload in this system talks to the Kubernetes API, no pod mounts a service-account
+token, and `verify-security.ps1` asserts both rather than trusting it. See
+`docs/system-design.md` §6.13 for the transport decision that kept it that way.
+
+**Not attempted**
+
+| # | Area | Why not |
+| --- | --- | --- |
+| — | **Bonus: multi-store provisioning** | Out of the twelve-day scope. The charts are shaped for it — one namespace and one `store-*` release per store, so it would be a second release rather than a rewrite — but shaping for it is not doing it |
+| 1 | Production-like VPS deploy | `values-prod.yaml` exists and `scripts/verify-prod-parity.mjs` proves it changes configuration only, field path by field path. **Never deployed to a real k3s box.** A template diff is not a deploy |
+| 3 | OAuth on the gateway | API keys only |
+| 4 | Handling many tools | 21 tools across three servers fit in a model's context, so the problem is not yet real here. A search-then-execute tool would be the approach |
+| 5 | Hosted MCP servers by image | Admins add upstreams by URL, not by container image |
+
 ### Known gaps, honestly
 
 Stated here rather than left to be discovered:
@@ -335,12 +366,103 @@ controller and one `ingressClassName`, so the "config changes only" property is 
 
 ## How to use it
 
-### Place an order
+In the order a reviewer would actually do it. Each step says what you should see, so a
+wrong result is recognisable as one.
 
-Open `http://store.urumi.local`, add a product to the cart, check out with Cash on
-Delivery, then confirm the order in `wp-admin`.
+### 1. Get the two logins
 
-### Connect an external MCP client
+Nothing is hardcoded, so the passwords are generated in the cluster on first install and
+read back from the Secret:
+
+```bash
+# dashboard - admin, then member
+kubectl get secret -n urumi-platform platform-bootstrap -o jsonpath='{.data.admin-password}' | base64 -d
+kubectl get secret -n urumi-platform platform-bootstrap -o jsonpath='{.data.member-password}' | base64 -d
+
+# wp-admin, if you want to look at the shop’s own admin (user: admin)
+kubectl get secret -n store-default store-default-wordpress -o jsonpath='{.data.wordpress-admin-password}' | base64 -d
+```
+
+The accounts are `admin@urumi.local` and `member@urumi.local`. Both matter - the difference
+between them is one of the four stand-out areas, and step 5 is where you see it.
+
+### 2. Sign in and look around
+
+Open `http://app.urumi.local` and sign in as **admin**. Seven tabs:
+
+| Tab | What it is | Member sees it? |
+| --- | --- | --- |
+| **Servers** | the three upstreams, their status and their tools | no |
+| **Tools** | all 21 tools as a connected client sees them | yes |
+| **Members** | the team, their roles, their keys | no |
+| **Permissions** | who may call which tool | no |
+| **API keys** | issue and revoke your own keys | yes |
+| **Audit** | every tool call, who made it, how long it took | yes |
+| **Chat** | the in-dashboard agent | yes |
+
+**On Servers**, all three rows should show a green **Connected** chip: `woo` with 5 tools,
+`notes` with 3, `everything` with 13. Expand a row to see each tool.
+
+Worth a look while you are there: **both `woo` and `notes` expose a tool called
+`list_products`.** That collision is deliberate. Their full names are `woo__list_products`
+and `notes__list_products`, which is how one endpoint carries two servers that disagree
+about a tool name.
+
+### 3. Place an order
+
+Open `http://store.urumi.local`, add a product to the cart, check out with **Cash on
+Delivery**. Remember what you bought - you will ask the agent about it in step 4.
+
+To confirm it landed, either open `http://store.urumi.local/wp-admin` (user `admin`,
+password from step 1) or just ask the chat agent, which is the more interesting check.
+
+### 4. Ask the agent to do something real
+
+**This needs a model key first** - one free key from console.groq.com and one `kubectl`
+command, both in [the chat agent section](#the-chat-agent-and-its-model-key) below. Without
+it Chat answers 503 and everything else still works.
+
+Then open **Chat** and try these in order. Each tool call appears inline as
+`called woo__list_orders (132ms, ok)` with the arguments the model chose.
+
+1. *"How many products are in the store?"* - one upstream, one tool call.
+2. *"Check the orders in the store, then save a note recording how many there were."* -
+   **two different upstreams in one answer**, which is the brief’s own test.
+3. *"Create a product called Test Mug priced 12."* - then reload the storefront. It is
+   really there.
+
+Then open **Audit**. Everything above is logged with the tool, the duration, the outcome -
+and `actor=chat` **under your own account**, not a service account. The agent acted as you
+and the log can prove it.
+
+> Groq’s free tier allows roughly **one complete chat a minute** - see the note at the end
+> of this section. If a reply stops with a 429, wait a minute.
+
+### 5. See the permissions working (the part worth doing carefully)
+
+Open a **private window** and sign in as `member@urumi.local`. Then compare:
+
+| | Admin | Member |
+| --- | --- | --- |
+| Tabs | 7 | **4** - no Servers, Members or Permissions |
+| Tools | 21 | **6** |
+
+Now ask the agent, as the member: *"create a product called Sneaky priced 5"*. It answers
+that it has no such tool - **not** that permission was denied, because the write tools were
+never sent to the model. Check the storefront: nothing was created.
+
+The distinction that matters: hiding a tool is not the control. Calling a hidden tool by
+name is also refused, and the refusal is logged with `outcome=denied`, as visibly as a
+success. Hiding alone would be cosmetic, because the name is guessable.
+
+### 6. Connect your own MCP client
+
+See [connecting an external MCP client](#connecting-an-external-mcp-client-in-detail)
+below - a URL and a key, nothing else. Issue the key on the **API keys** tab; the secret is
+shown exactly once because only its `sha256` is stored.
+
+
+### Connecting an external MCP client, in detail
 
 The WooCommerce server is already registered on a fresh install, so the only thing you need
 is a key. Issue one as the seeded admin:
@@ -390,7 +512,7 @@ Every tool from every enabled upstream appears under this one endpoint, namespac
 A revoked key is refused on the next call, and disabling a server removes its tools from
 `tools/list` *and* refuses a call that names one.
 
-### Use the chat agent
+### The chat agent and its model key
 
 **First, a model key.** The chat agent is the one feature needing an external service. Make
 a free key at console.groq.com, then:
