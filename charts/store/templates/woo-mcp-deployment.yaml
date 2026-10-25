@@ -42,8 +42,15 @@ spec:
             # The in-cluster Service, never the public URL. This server reaches the store
             # over the cluster network, which is precisely why it needs no route of its
             # own.
+            #
+            # Overridable rather than hardcoded. The default is right for every
+            # deployment this chart installs, but a cluster running TLS between pods - a
+            # mesh, or WordPress terminating its own certificate - needs an https origin
+            # here, and that must be a value. A template edit to move between
+            # environments would break the one claim this project makes about production:
+            # same charts, configuration only.
             - name: WC_BASE_URL
-              value: {{ printf "http://%s" (include "store.wordpress.name" .) | quote }}
+              value: {{ .Values.wooMcp.storeBaseUrl | default (printf "http://%s" (include "store.wordpress.name" .)) | quote }}
             # ...but the Host header carries the public hostname, because WordPress
             # answers a Host it does not recognise with a 301 to its configured siteurl.
             # Without this, every in-cluster call would be redirected to a URL this pod

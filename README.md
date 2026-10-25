@@ -113,6 +113,14 @@ Stated here rather than left to be discovered:
 - **Never deployed to a real k3s VPS.** `verify-prod-parity.mjs` proves the manifests differ
   only in configuration and `values-prod.yaml` carries an executable secret runbook, but a
   template diff is not a deploy. Renting a server was out of scope from the plan onward.
+  Tracing what *would* happen found three things that have since been fixed: the five
+  images were never published anywhere a VPS could pull them, `global.imageRegistry` was
+  rewriting the stock wordpress/mariadb/postgres images into a namespace nobody publishes,
+  and `environmentType: production` broke woo-mcp's application-password auth because its
+  hop to WordPress does not go through the ingress that terminates TLS. All three were
+  found by reading the rendered prod manifests rather than by deploying, which is the
+  limit of what that method catches — a real deploy would still be the first time
+  anything runs.
 - **Prometheus and Grafana are not deployed.** The gateway exposes `/metrics` with
   `prom-client` and the series are there; nothing scrapes them, and there are no alert
   rules.
@@ -301,6 +309,74 @@ and compares the field paths of every shared object - 12 checks, 0 failures. Dif
 that are themselves configuration (the TLS block, the cert-manager annotation, externally
 managed Secrets, the disabled reference server) are declared there with reasons, and
 anything undeclared fails.
+
+**First publish the images.** `values-prod.yaml` sets `global.imageRegistry` and
+`imagePullPolicy: Always`, so a VPS pulls the five images this repo builds rather than
+finding them in the node the way kind does. Nothing publishes the `dev` tag, so an install
+against unpublished images is an `ImagePullBackOff` on every workload.
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+That runs `.github/workflows/publish-images.yml`, which builds woo-mcp, notes-mcp,
+everything-mcp, gateway and dashboard and pushes them to
+`ghcr.io/<owner>/urumi/<name>:v0.1.0`. The three prod overlays pin that same tag; change it
+in all three when you cut a different release, or paste the digests the workflow prints if
+you want them immutable. The stock images (wordpress, mariadb, postgres, wp-cli) carry an
+explicit `registry: docker.io` so the global registry never rewrites them.
+
+**Then make the five packages public.** GHCR publishes privately by default, and these
+charts define no `imagePullSecrets`, so an otherwise correct install fails with `401
+Unauthorized` on every pod. On github.com: *Profile → Packages → `urumi/<name>` → Package
+settings → Change visibility → Public*, once per image. The alternative is a pull secret
+in every namespace, which is three more objects to rotate for a demo deployment.
+
+### Sizing
+
+Summed from the prod render, requests only, long-running pods:
+
+| Workload | Replicas | CPU | Memory |
+| --- | --- | --- | --- |
+| mariadb | 1 | 250m | 1024Mi |
+| wordpress | 1 | 250m | 512Mi |
+| woo-mcp | 2 | 200m | 256Mi |
+| postgres | 1 | 250m | 512Mi |
+| gateway | 2 | 500m | 512Mi |
+| dashboard | 2 | 50m | 96Mi |
+| notes-mcp | 1 | 25m | 64Mi |
+| **Total** | | **1525m** | **2976Mi** |
+
+k3s itself adds roughly 500m and 700Mi for Traefik, CoreDNS, metrics-server and the
+local-path provisioner. So **4 vCPU / 8GB** is the comfortable size and a 4GB box does not
+fit without dropping replicas - and the replica worth keeping is the gateway's, since two
+of them serving one stateless `/mcp` is the point of that design.
+
+### If you want the HTTP→HTTPS redirect
+
+`values-prod.yaml` does not set the Traefik redirect annotation, because the annotation
+alone does nothing: it names a `Middleware` object that has to exist first. Create it
+before adding the annotation back:
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: default
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+EOF
+```
+
+Then set, in `charts/store/values-prod.yaml` under `ingress.annotations`:
+
+```yaml
+traefik.ingress.kubernetes.io/router.middlewares: default-redirect-https@kubernetescrd
+```
 
 Four Secrets have to exist before the platform chart installs. The commands, with the
 consequence of each rotation, are in `charts/platform/values-prod.yaml` next to the names

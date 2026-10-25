@@ -18,6 +18,11 @@ platform:
 
 postgres:
   image:
+    # Explicit, because `global.imageRegistry` exists for the images WE build and push.
+    # Without this line it also rewrites this one, and values-prod.yaml turns a stock
+    # Docker Hub image into ghcr.io/<owner>/postgres - which nobody publishes, so
+    # production fails to pull a dependency it was never meant to host.
+    registry: docker.io
     repository: postgres
     tag: '18.2-alpine'
   auth:
@@ -66,6 +71,8 @@ migrations:
   # A separate client image would be smaller and would introduce a version skew nobody
   # thinks about until a newer server speaks a protocol the older client does not.
   image:
+    # See postgres.image.registry above: stock image, not ours to publish.
+    registry: docker.io
     repository: postgres
     tag: '18.2-alpine'
   # Three attempts. A migration that fails for a transient reason (the database finished

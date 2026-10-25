@@ -18,6 +18,15 @@ postgres:
     limits: { cpu: '2', memory: 2Gi }
 
 gateway:
+  # Set to the tag published by .github/workflows/publish-images.yml, NOT 'dev'.
+  #
+  # The default is 'dev', which is correct locally: kind loads that image into the node
+  # and nothing is pulled. In production `imagePullPolicy: Always` means this is fetched
+  # from ghcr.io, and nothing publishes a 'dev' tag - so leaving the default here is an
+  # ImagePullBackOff on every gateway pod. Replace with a digest at release time; a tag
+  # can be repointed, a digest cannot.
+  image:
+    tag: v0.1.0
   replicas: 2
   resources:
     requests: { cpu: 250m, memory: 256Mi }
@@ -26,7 +35,16 @@ gateway:
     enabled: true
     requestsPerMinute: 60
 
+# The seed Job runs the gateway image, so it is pinned to the same tag for the same
+# reason - and it must be the same build, because the argon2id password hash it writes
+# has to be produced by exactly the code the login route verifies against.
+seed:
+  image:
+    tag: v0.1.0
+
 dashboard:
+  image:
+    tag: v0.1.0
   replicas: 2
 
 ingress:

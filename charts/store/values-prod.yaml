@@ -39,6 +39,10 @@ wordpress:
     limits: { cpu: '2', memory: 1536Mi }
 
 wooMcp:
+  # Published by .github/workflows/publish-images.yml. 'dev' exists only in a kind node;
+  # with imagePullPolicy Always, production pulls this from ghcr.io or fails.
+  image:
+    tag: v0.1.0
   replicas: 2
   resources:
     requests: { cpu: 100m, memory: 128Mi }
@@ -52,9 +56,22 @@ ingress:
     clusterIssuer: letsencrypt-prod
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
-    # Redirect plain HTTP at the edge rather than in WordPress, so the app never has to
-    # know whether it is behind TLS.
-    traefik.ingress.kubernetes.io/router.middlewares: default-redirect-https@kubernetescrd
+    # The HTTP->HTTPS redirect annotation is deliberately NOT set, and the reason is worth
+    # recording because the line was here and was wrong:
+    #
+    #   traefik.ingress.kubernetes.io/router.middlewares: default-redirect-https@kubernetescrd
+    #
+    # The intent was right - redirect at the edge, so WordPress never has to know whether
+    # it is behind TLS. The execution was not. That annotation names a Traefik `Middleware`
+    # object in the `default` namespace, and no template in this repository creates one.
+    # Traefik cannot build a router whose middleware does not resolve, so on a fresh k3s
+    # the storefront answers 404 - with the Ingress object present and correct, which is
+    # the expensive kind of wrong to diagnose.
+    #
+    # An annotation may only reference an object something installs. Create the Middleware
+    # first (manifest in README.md under "Deploy to a k3s VPS"), then add this back. k3s
+    # can also do the redirect globally via a HelmChartConfig for its bundled Traefik,
+    # which needs no per-Ingress annotation at all.
 
 networkPolicy:
   enabled: true

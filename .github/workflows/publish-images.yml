@@ -1,0 +1,80 @@
+# Builds the five images this repository owns and pushes them to GHCR.
+#
+# Why this exists: values-prod.yaml sets `global.imageRegistry` and
+# `imagePullPolicy: Always`, so a k3s install pulls these by name. Without a published
+# image a production deploy fails at ImagePullBackOff on every workload - the charts are
+# correct and the cluster has nothing to run. Local development does not need this: kind
+# loads the images into the node directly.
+#
+# Repository names match `image.repository` in each chart's values.yaml (`urumi/<name>`),
+# so the rendered reference is `ghcr.io/<owner>/urumi/<name>:<tag>` and nothing in the
+# charts has to know this workflow exists.
+
+name: publish-images
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      # Five independent builds; one failing should not hide the others.
+      fail-fast: false
+      matrix:
+        service: [woo-mcp, notes-mcp, everything-mcp, gateway, dashboard]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Lowercased: GHCR rejects an uppercase path component, and a GitHub owner may
+      # contain capitals.
+      - name: Resolve owner and tag
+        id: meta
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Context is the repository root for every service: the Dockerfiles build npm
+      # workspaces and need the root package-lock.json, which is also why they are not
+      # built from their own directory.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ghcr.io/${{ steps.meta.outputs.owner }}/urumi/${{ matrix.service }}:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Printed so the digests can be pasted into values-prod.yaml. A tag can be
+      # repointed; a digest cannot, which is the whole argument for pinning in
+      # production.
+      - name: Digest to pin
+        run: |
+          echo "urumi/${{ matrix.service }} digest: ${{ steps.push.outputs.digest }}"

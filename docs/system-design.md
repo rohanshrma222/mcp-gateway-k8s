@@ -464,12 +464,35 @@ One difference is deliberate and the script reports rather than fails on it:
 `longRunningOperation` tools are test fixtures and exactly what you would not leave
 registered on a real deployment.
 
-The single most load-bearing value is `wordpress.environmentType: local`. WordPress offers
-Application Passwords over plain HTTP only when `wp_get_environment_type()` returns `local`,
-and woo-mcp authenticates to the WooCommerce REST API with one. In production it becomes
-`production` and the path is TLS end to end. (WooCommerce's own Basic auth requires SSL;
-over plain HTTP it falls back to OAuth 1.0a, which is the documented alternative if
-Application Passwords were unavailable.)
+The single most load-bearing value is `wordpress.environmentType`. WordPress offers
+Application Passwords over plain HTTP only when `wp_get_environment_type()` returns
+`local`, and woo-mcp authenticates to the WooCommerce REST API with one.
+
+Production sets it to `production`, and that alone would break the entire MCP layer — so
+the mechanism is worth stating exactly, because the obvious answer is wrong. TLS does
+terminate at the ingress, but **woo-mcp does not go through the ingress**: it calls the
+WordPress Service directly over the cluster network, which is precisely why it needs no
+external route. So `is_ssl()` is false on exactly the requests that carry the credential,
+and every WooCommerce REST call would answer `401` — in production only, which is the
+worst place to find out.
+
+What makes it work is a scheme check in `wp-config`, rendered only when the environment
+type is not `local`. A request through Traefik always carries `X-Forwarded-*`; a direct
+pod-to-pod request carries none, so the absence of those headers identifies the in-cluster
+path and only that path is asserted as secure. The public path keeps WordPress's SSL
+requirement untouched.
+
+The trade, stated rather than buried: WordPress's rule exists to stop a credential
+crossing an untrusted network, and this hop does not cross one — the store NetworkPolicy
+admits port 80 on the WordPress pod from the woo-mcp pods and the ingress controller only,
+so the only thing that can take the exemption is the process that already holds the
+credential. The alternative is TLS between pods, which means certificate issuance and
+rotation for a single internal hop; `wooMcp.storeBaseUrl` exists as a value so a cluster
+that already has a mesh can point woo-mcp at an `https://` origin without touching a
+template.
+
+(WooCommerce's own Basic auth requires SSL; over plain HTTP it falls back to OAuth 1.0a,
+which is the documented alternative if Application Passwords were unavailable.)
 
 ## 12. How the claims in this document are checked
 

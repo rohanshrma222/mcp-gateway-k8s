@@ -160,15 +160,47 @@ spec:
                      (wp_is_application_passwords_available). woo-mcp authenticates to the
                      WooCommerce REST API with one, so without this the entire MCP layer
                      would need TLS inside the cluster before it could make a single call.
-                     values-prod.yaml sets this to 'production' and terminates TLS at the
-                     ingress. */}}
+                     values-prod.yaml sets this to 'production'; the block below is what
+                     keeps woo-mcp working once it does. */}}
                 define('WP_ENVIRONMENT_TYPE', '{{ .Values.wordpress.environmentType }}');
                 {{/* Trust the ingress controller's forwarded scheme. Without it WordPress
                      sees a plain HTTP request from Traefik, builds http:// URLs, and the
                      browser blocks them as mixed content on an https page. */}}
-                if (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                if (isset($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+                  if ($_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                    $_SERVER['HTTPS'] = 'on';
+                  }
+                }
+                {{- if ne .Values.wordpress.environmentType "local" }}
+                {{- /* The in-cluster hop, and the reason production works at all.
+
+                     With WP_ENVIRONMENT_TYPE 'production', WordPress requires is_ssl()
+                     before it will accept an Application Password. TLS terminates at the
+                     ingress, but woo-mcp does not go through the ingress: it calls the
+                     Service directly over the cluster network, precisely so it needs no
+                     external route. So is_ssl() is false on exactly the requests that
+                     carry the credential, and every WooCommerce REST call would answer
+                     401 - the whole MCP layer, dead, in production only.
+
+                     A request through Traefik always carries X-Forwarded-*; a direct
+                     pod-to-pod request carries none. So the absence of those headers
+                     identifies the in-cluster path, and only that path is treated as
+                     secure. The public path keeps WordPress's SSL requirement untouched.
+
+                     What this trades: WordPress's rule exists to stop a credential
+                     crossing an untrusted network. This hop does not cross one. The
+                     store NetworkPolicy admits port 80 on this pod from the woo-mcp pods
+                     and the ingress controller only, so "a pod that can reach WordPress
+                     directly" is woo-mcp, which already holds the credential.
+
+                     Not rendered at all when environmentType is 'local', where
+                     Application Passwords work over HTTP anyway and asserting HTTPS
+                     would make WordPress hand back https:// permalinks for a site served
+                     over http. */}}
+                elseif (!isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
                   $_SERVER['HTTPS'] = 'on';
                 }
+                {{- end }}
                 {{/* The plugin and theme editors execute arbitrary PHP from a browser
                      form. Nothing in this deployment needs them, and the filesystem is
                      managed by Helm and the bootstrap Job. */}}

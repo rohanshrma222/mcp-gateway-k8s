@@ -6,6 +6,10 @@ global:
   imagePullPolicy: Always
 
 notesMcp:
+  # Published by .github/workflows/publish-images.yml. 'dev' exists only in a kind node;
+  # with imagePullPolicy Always, production pulls this from ghcr.io or fails.
+  image:
+    tag: v0.1.0
   # replicas stays at the default of 1, and this line exists to record why it is NOT
   # raised here.
   #

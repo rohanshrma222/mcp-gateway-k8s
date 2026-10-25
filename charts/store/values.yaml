@@ -29,6 +29,10 @@ store:
 
 mariadb:
   image:
+    # Explicit, because `global.imageRegistry` exists for the images WE build and push.
+    # Without this line values-prod.yaml rewrites this to ghcr.io/<owner>/mariadb, which
+    # nobody publishes - production fails to pull a stock dependency.
+    registry: docker.io
     repository: mariadb
     tag: '11.8.4'
   # Credentials are never literals here. The chart generates them on first install with
@@ -107,6 +111,8 @@ mariadb:
 
 wordpress:
   image:
+    # See mariadb.image.registry: stock image, not ours to publish.
+    registry: docker.io
     repository: wordpress
     # WordPress 7.1.3. Pinned to 7.x because current WooCommerce requires WordPress >= 7.0
     # and refuses to install on 6.9 - found by the bootstrap hook failing with
@@ -185,6 +191,8 @@ bootstrap:
   # nothing except re-asserting the application password from the Secret.
   enabled: true
   image:
+    # See mariadb.image.registry: stock image, not ours to publish.
+    registry: docker.io
     repository: wordpress
     tag: 'cli-2.12-php8.3'
   resources:
@@ -221,6 +229,14 @@ wooMcp:
     repository: urumi/woo-mcp
     tag: dev
   replicas: 1
+  # Origin woo-mcp uses to reach WordPress. Empty means the in-cluster Service over
+  # plain HTTP, which is correct here: the hop never leaves the cluster and the store
+  # NetworkPolicy admits it from these pods only.
+  #
+  # Set it to an https:// origin if you run TLS between pods. It exists as a value
+  # because the alternative - editing the template to deploy somewhere else - is exactly
+  # what "same charts, configuration only" rules out.
+  storeBaseUrl: ''
   # No ingress key at all, and that is the point: the WooCommerce MCP server has no
   # external route to disable, so "unreachable from outside the cluster" is a property of
   # what does not exist rather than a rule someone has to maintain.
