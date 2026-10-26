@@ -173,6 +173,27 @@ spec:
             setting it, from a Secret that may not exist - makes the pod fail to start with
             a CreateContainerConfigError, which takes the whole platform down because one
             optional feature was not configured.
+
+            That is exactly what happened, because the guard above was the wrong guard.
+            `chatEnabled` is true when a Secret *name* is configured, and
+            values-local.yaml configures one unconditionally - deliberately, so local and
+            prod enable the same feature set. But a configured name is not an existing
+            object. On a cluster where nobody had yet run the `kubectl create secret
+            generic urumi-groq` line from the README, both gateway replicas sat in
+            CreateContainerConfigError, `helm --wait` timed out, and the platform release
+            failed - on a first install, from a clean cluster, which is the one path that
+            has to work.
+
+            It survived review because the Secret had been created by hand months earlier
+            and the cluster was never rebuilt. The same blind spot deploy-local.ps1 exists
+            to close: the path was not the thing being run.
+
+            So `optional: true`. A missing Secret now leaves the variable unset, which is
+            the state the paragraph above already describes as supported: the gateway
+            starts, the config schema accepts the absence, and POST /api/chat answers 503.
+            The `if` stays, because rendering nothing at all is still tidier when no key is
+            configured in either form - but it is no longer the thing standing between a
+            fresh clone and a running platform.
             */}}
             {{- if include "platform.gateway.chatEnabled" . }}
             - name: GROQ_API_KEY
@@ -180,6 +201,7 @@ spec:
                 secretKeyRef:
                   name: {{ include "platform.gateway.groqSecretName" . }}
                   key: groq-api-key
+                  optional: true
             {{- end }}
             - name: GROQ_MODEL
               value: {{ .Values.chat.model | quote }}

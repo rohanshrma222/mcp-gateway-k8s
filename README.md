@@ -198,6 +198,9 @@ Threats and mitigations: **[docs/threat-model.md](docs/threat-model.md)**.
 
 Roughly 8 GB of free RAM and host ports 80 and 443 unoccupied.
 
+Starting from a machine with none of these installed? [docs/commands.md](docs/commands.md)
+Step 1 has the `winget` line for each one.
+
 ---
 
 ## Local setup
@@ -630,7 +633,8 @@ again in 8s". Signing in as a member helps, since a member is sent 6 schemas ins
 README.md                  this file
 docs/system-design.md      system design and tradeoffs  (deliverable)
 docs/threat-model.md       threat model                  (deliverable)
-docs/demo-script.md        runbook for the demo video
+docs/system.md             the six video topics explained, for speaking to
+docs/commands.md           every command to run it locally, and what each one does
 kind/cluster.yaml          cluster definition, k8s pinned by digest
 kind/calico-values.yaml    CNI values — NetworkPolicy enforcement
 kind/traefik-values.yaml   ingress controller values
@@ -672,6 +676,9 @@ requirement is enforced by the template rather than by review.
 ---
 
 ## Commands
+
+The short list is below. Every command needed to run this locally, with what each one
+actually does and what to do when it fails, is in **[docs/commands.md](docs/commands.md)**.
 
 ```powershell
 # repo

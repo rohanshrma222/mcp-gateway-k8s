@@ -8,13 +8,24 @@
  * see" is a confusing bug to chase.
  *
  * Available to any authenticated user, not just admins. A member needs to know what tools
- * they can reach - it is their own capability list. What a member may *call* is the
- * per-tool permission layer in stage 9, and when that arrives this list is filtered by it
- * so a member never sees a tool they would be refused. Today there is no permission layer,
- * so it is the full list and this note is here so the gap is not mistaken for a decision.
+ * they can reach - it is their own capability list.
+ *
+ * And "can reach" is the whole point, so this list is filtered by the per-tool permission
+ * layer, through the same `decide()` the MCP endpoint uses in mcp/server.ts. The note that
+ * used to sit here said the filter would arrive with stage 9 and that the unfiltered list
+ * was a gap rather than a decision. Stage 9 arrived; the note did not. The result was a
+ * dashboard that showed a member all 21 tools while `tools/list` served them 6, which is
+ * exactly the "the dashboard shows a tool my client cannot see" confusion the paragraph
+ * above claims this route cannot cause.
+ *
+ * One function, called from both places, is what makes that claim true rather than
+ * aspirational - so the filter here is deliberately not a reimplementation. It matches on
+ * `upstreamToolName`, not the namespaced name, because that is what the rules store.
  */
 import type { FastifyInstance, FastifyPluginOptions } from 'fastify';
 import { listAggregatedTools } from '../mcp/aggregator.js';
+import { decide, cacheKey } from '../auth/permissions.js';
+import type { Principal } from '../auth/middleware.js';
 import type { Db } from '../db.js';
 
 export interface ToolRouteDeps {
@@ -28,7 +39,20 @@ export function toolRoutes(deps: ToolRouteDeps) {
     _opts: FastifyPluginOptions,
   ): Promise<void> {
     app.get('/api/tools', { preHandler: deps.requireAuth as never }, async (request, reply) => {
-      const tools = await listAggregatedTools(deps.db);
+      const all = await listAggregatedTools(deps.db);
+      const principal = request.principal as Principal;
+
+      // One batch query for the whole list, the same shape mcp/server.ts uses: a per-tool
+      // round trip here would make the dashboard's cost grow with the catalogue.
+      const decisions = await decide(
+        deps.db,
+        { userId: principal.userId, role: principal.role },
+        all.map((tool) => ({ serverId: tool.serverId, toolName: tool.upstreamToolName })),
+      );
+
+      const tools = all.filter(
+        (tool) => decisions.get(cacheKey(tool.serverId, tool.upstreamToolName))?.allowed === true,
+      );
 
       // Also return each upstream's status, so the dashboard can render a tool next to the
       // health of the server behind it. Without this the UI would show a tool list with no
